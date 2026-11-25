@@ -1,0 +1,15 @@
+[project]
+name = "hwlock"
+version = "0.1.0"
+description = "Serialise access to shared hardware (a Jetson, a GPU box, a robot, a test rig) between AI agents and humans"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = []  # server and client use the Python standard library only
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["docker: needs a docker daemon; builds the image and restarts a real container"]
+addopts = "-ra"
