@@ -60,6 +60,19 @@ def _peer_alive(sock: socket.socket) -> bool:
         return False
 
 
+def _wait(value, cap: float) -> float:
+    """Long-poll wait in seconds from the request: a number (or numeric string), 0..cap; NaN -> 0."""
+    if value is None:
+        return 0.0
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise BadRequest(f"wait must be a number of seconds: {value!r}")
+    try:
+        w = float(value)
+    except ValueError:
+        raise BadRequest(f"wait must be a number of seconds: {value!r}") from None
+    return 0.0 if w != w else max(0.0, min(w, cap))
+
+
 def _fmt_s(s) -> str:
     if s is None:
         return ""
@@ -138,6 +151,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _body(self) -> dict:
         n = int(self.headers.get("Content-Length") or 0)
+        if n < 0:
+            raise BadRequest("bad Content-Length")
         if n > 65536:
             raise BadRequest("body too large")
         raw = self.rfile.read(n) if n else b""
@@ -182,7 +197,7 @@ class Handler(BaseHTTPRequestHandler):
             if method == "POST" and len(parts) == 3 and parts[0] == "r":
                 res, op, b = parts[1], parts[2], self._body()
                 if op == "acquire":
-                    wait = min(float(b.get("wait", 0) or 0), self.app.cfg.poll_s)
+                    wait = _wait(b.get("wait"), self.app.cfg.poll_s)
                     sock = self.connection
                     out = store.acquire(res, b.get("owner"), reason=b.get("reason"), host=b.get("host"),
                                         pid=b.get("pid"), lease_s=b.get("lease"), ticket=b.get("ticket"),
@@ -202,7 +217,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, {"error": "not_found", "message": f"no route {method} {url.path}"})
         except HwlockError as err:
             return self._send(err.status, err.payload())
-        except ValueError as err:
+        except (ValueError, TypeError, OverflowError) as err:
             return self._send(400, {"error": "bad_request", "message": str(err)})
         except Exception as err:  # pragma: no cover - last resort, keep the server up
             print(f"hwlock: internal error: {err!r}", file=sys.stderr, flush=True)

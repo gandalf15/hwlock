@@ -210,3 +210,38 @@ def test_long_poll_returns_waiting_after_wait_s(store):
     out = store.acquire("gpu", "b", wait_s=0.5)
     dt = time.monotonic() - t0
     assert out["state"] == "waiting" and 0.45 < dt < 1.5
+
+
+def test_long_poll_wakes_on_release_that_races_its_wait_timeout(store):
+    """The waiter re-checks its socket about once a second. A release landing exactly as one of those
+    1 s waits times out must still wake it (Condition.wait() reports such a notify as a timeout)."""
+    store.acquire_step("gpu", "a")
+    t = store.acquire_step("gpu", "b")["ticket"]
+    out = {}
+
+    def waiter():
+        t0 = time.monotonic()
+        out["res"] = store.acquire("gpu", "b", ticket=t, wait_s=5)
+        out["dt"] = time.monotonic() - t0
+
+    th = threading.Thread(target=waiter)
+    th.start()
+    time.sleep(1.0)
+    store.release("gpu", "a")
+    th.join(10)
+    assert out["res"]["state"] == "acquired" and out["dt"] < 2
+
+
+def test_long_poll_drops_ticket_when_client_hangs_up_before_its_turn(store):
+    store.acquire_step("gpu", "a")
+    t = store.acquire_step("gpu", "dead")["ticket"]
+    alive = {"v": True}
+    out = {}
+    th = threading.Thread(target=lambda: out.update(
+        res=store.acquire("gpu", "dead", ticket=t, wait_s=10, may_grant=lambda: alive["v"])))
+    th.start()
+    time.sleep(0.3)
+    alive["v"] = False
+    th.join(3)
+    assert out["res"]["state"] == "abandoned"
+    assert store.status("gpu")["queue"] == [] and kinds(store)[-1] == "abandon"

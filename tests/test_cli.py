@@ -120,6 +120,31 @@ def test_killed_waiter_is_not_granted_the_lock(server):
     assert server.api.events("jetson", {"abandon"})[0]["owner"] == "dead"
 
 
+def test_killed_waiter_is_dropped_even_when_its_turn_comes_after_its_poll(make_server):
+    """SIGKILL while long-polling, its turn comes only after that poll's server-side wait has ended:
+    the server must notice the closed connection during the poll (not wait for the heartbeat
+    timeout, 60 s here), drop the ticket, and the next waiter must get the lock at once."""
+    server = make_server(HWLOCK_POLL_S="2", HWLOCK_HEARTBEAT_S="60")
+    poll = {"HWLOCK_LONG_POLL_S": "2"}
+    run_client(server, "acquire", "jetson", "a")
+    dead = popen_client(server, "acquire", "jetson", "dead", env=poll)
+    wait_for(lambda: server.api.status("jetson")["queue"])
+    live = popen_client(server, "acquire", "jetson", "live", env=poll)
+    wait_for(lambda: len(server.api.status("jetson")["queue"]) == 2)
+    dead.kill()
+    dead.wait()
+    time.sleep(4)  # > the dead client's last poll (2 s): its turn comes after the server answered it
+    assert [q["owner"] for q in server.api.status("jetson")["queue"]] == ["live"], \
+        "dead waiter's ticket must be gone before its turn"
+    t0 = time.monotonic()
+    run_client(server, "release", "jetson", "a")
+    live.wait(10)
+    assert live.returncode == 0 and holder(server.api) == "live"
+    assert time.monotonic() - t0 < 3
+    assert [e["owner"] for e in server.api.events("jetson", {"abandon", "drop"})] == ["dead"]
+    assert server.api.events("jetson", {"abandon"})[0]["owner"] == "dead"
+
+
 def test_run_auto_renews_and_releases(server):
     api = server.api
     p = popen_client(server, "run", "jetson", "runner", "long job", "--lease", "2", "--",

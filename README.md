@@ -93,7 +93,8 @@ curl -s -XPOST $HWLOCK_URL/r/jetson/release -d '{"owner":"job-1"}'              
 - **FIFO.** Tickets get increasing ids, and only the first waiting ticket can be granted. The grant happens only while that ticket's own client has a request in flight with its connection still open. A waiter that has died is never handed the lock.
 - **Leases.** The default lease is 1800 s (`HWLOCK_DEFAULT_LEASE_S`). You can override it per call with `--lease`, up to `HWLOCK_MAX_LEASE_S`, which defaults to 24 h. When a holder's lease expires, the holder is evicted and an `expire` event is logged. `renew` sets the lease to *now + lease*.
 - **Heartbeats.** Each acquire request a waiting ticket makes counts as its heartbeat, including the long-poll requests. A ticket with no heartbeat for `HWLOCK_HEARTBEAT_S` (120 s) is dropped (`drop` event). A client that crashes while waiting therefore loses its place.
-  - If the client is killed during a long-poll, its ticket is dropped as soon as it is its turn (`abandon` event).
+  - If the client is killed during a long-poll, the server notices the closed connection within about 1 s and drops the ticket at once (`abandon` event), whatever its position. Only a client killed in the few milliseconds between two polls waits for the heartbeat timeout instead.
+  - Clients must keep the connection open while they wait: a client that half-closes its socket after sending the request counts as gone.
   - If the client is stopped with Ctrl-C or SIGTERM, it withdraws its ticket at once.
 - **Restarts.** The holder, the queue and the audit log are stored in SQLite.
   - Leases are absolute server timestamps, so they keep counting while the server is down.

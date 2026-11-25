@@ -42,6 +42,29 @@ def test_bad_input(api, server):
     assert api.acquire("jetson", "a", ticket=999)[0] == 410
 
 
+def test_malformed_values_are_400_not_500(api, server):
+    for bad in ({"wait": [1]}, {"wait": {"a": 1}}, {"wait": "abc"}, {"pid": 10 ** 30}, {"pid": [1]},
+                {"ticket": 1e300}, {"ticket": 10 ** 30}, {"lease": [5]}, {"lease": "nan"}):
+        st, out = api.acquire("jetson", "a", **bad)
+        assert st == 400, (bad, st, out)
+    assert api.acquire("jetson", "a", wait="nan")[0] == 200  # NaN wait counts as 0
+    assert api.post("/r/jetson/renew", {"owner": "a", "lease": {}})[0] == 400
+    assert api.post("/r/jetson/cancel", {"ticket": 1e300})[0] == 400
+    assert "internal error" not in server.log.read_text()
+    # a negative Content-Length must be rejected, not read until the peer closes
+    import socket
+    with socket.create_connection(("127.0.0.1", server.port), timeout=5) as s:
+        s.sendall(b"POST /r/jetson/acquire HTTP/1.1\r\nHost: x\r\nContent-Length: -1\r\n\r\n")
+        assert s.recv(100).startswith(b"HTTP/1.1 400")
+
+
+def test_holder_reacquire_cannot_delete_another_owners_ticket(api):
+    api.acquire("jetson", "a")
+    t = api.acquire("jetson", "b", wait=0)[1]["ticket"]
+    assert api.acquire("jetson", "a", ticket=t)[0] == 200
+    assert [q["ticket"] for q in api.status("jetson")["queue"]] == [t]
+
+
 def test_status_lists_resources_and_unknown_resource_is_free(api):
     api.acquire("a-res", "x")
     api.acquire("b-res", "y")

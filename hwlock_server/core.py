@@ -104,9 +104,12 @@ def _pid(value: Any) -> int | None:
     if value is None:
         return None
     try:
-        return int(value)
-    except (TypeError, ValueError):
+        pid = int(value)
+    except (TypeError, ValueError, OverflowError):
         raise BadRequest(f"pid must be an integer: {value!r}") from None
+    if not -2**63 <= pid < 2**63:
+        raise BadRequest(f"pid out of range: {value!r}")
+    return pid
 
 
 class Store:
@@ -129,6 +132,7 @@ class Store:
         self.log = log
         self.lock = threading.RLock()
         self._dirty = False
+        self.changes = 0  # bumped on every committed state change (wait()'s return value can miss one)
         self.cond = threading.Condition(self.lock)
         self.db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self.db.row_factory = sqlite3.Row
@@ -158,6 +162,7 @@ class Store:
             else:
                 self.db.execute("COMMIT")
                 if self._dirty:
+                    self.changes += 1
                     self.cond.notify_all()
 
     def _event(self, now, resource, kind, owner=None, ticket=None, detail=None):
@@ -249,7 +254,7 @@ class Store:
         if ticket is not None:
             try:
                 ticket = int(ticket)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 raise BadRequest(f"ticket must be an integer: {ticket!r}") from None
         with self._tx() as now:
             self._sweep(now)
@@ -257,7 +262,8 @@ class Store:
             if r["holder_owner"] == owner:
                 # Idempotent re-acquire by the holder: keep holding, refresh the lease.
                 if ticket is not None and ticket != r["holder_ticket"]:
-                    self.db.execute("DELETE FROM tickets WHERE id=? AND resource=?", (ticket, resource))
+                    self.db.execute("DELETE FROM tickets WHERE id=? AND resource=? AND owner=?",
+                                    (ticket, resource, owner))
                 self.db.execute("UPDATE resources SET expires=?, lease_s=? WHERE name=?",
                                 (now + lease, lease, resource))
                 self._event(now, resource, "reacquire", owner, r["holder_ticket"], {"lease_s": lease})
@@ -309,10 +315,13 @@ class Store:
         """Long-poll acquire: retries until acquired, until the queue position or holder changes
         (so the client can show progress), or until `wait_s` (monotonic) has passed.
 
-        Each attempt refreshes the ticket's heartbeat. Wakes on every state change (notify_all) and
-        at least every heartbeat_s/4 to keep the ticket alive.
+        Each attempt refreshes the ticket's heartbeat (on every state change and at least every
+        heartbeat_s/4). The client's connection is checked about once a second: when it is gone
+        (killed, Ctrl-C) the ticket is dropped at once ("abandon"), so a dead waiter never blocks the
+        queue until its heartbeat times out.
         """
         deadline = time.monotonic() + max(0.0, float(wait_s))
+        touch_s = max(0.05, self.heartbeat_s / 4)
 
         def view(r):
             return r.get("position"), (r.get("holder") or {}).get("owner")
@@ -321,13 +330,28 @@ class Store:
             res = self.acquire_step(resource, owner, may_grant=may_grant, **kw)
             kw["ticket"] = res.get("ticket")
             seen = view(res)
+            last_step = time.monotonic()
             while res["state"] == "waiting" and view(res) == seen:
                 left = deadline - time.monotonic()
                 if left <= 0:
                     break
-                self.cond.wait(min(left, max(0.05, self.heartbeat_s / 4)))
-                res = self.acquire_step(resource, owner, may_grant=may_grant, **kw)
+                seen_changes = self.changes
+                self.cond.wait(min(left, 1.0, touch_s))
+                if not may_grant():
+                    return self._abandon(resource, owner, res["ticket"])
+                if self.changes != seen_changes or time.monotonic() - last_step >= touch_s or time.monotonic() >= deadline:
+                    res = self.acquire_step(resource, owner, may_grant=may_grant, **kw)
+                    last_step = time.monotonic()
+            if res["state"] == "waiting" and not may_grant():
+                return self._abandon(resource, owner, res["ticket"])
             return res
+
+    def _abandon(self, resource, owner, ticket) -> dict:
+        """The waiting client hung up: withdraw its ticket now."""
+        with self._tx() as now:
+            if self.db.execute("DELETE FROM tickets WHERE id=? AND resource=?", (ticket, resource)).rowcount:
+                self._event(now, resource, "abandon", owner, ticket)
+        return {"state": "abandoned", "resource": resource, "ticket": ticket}
 
     def renew(self, resource, owner, *, lease_s=None) -> dict:
         _name(resource, "resource")
@@ -383,7 +407,7 @@ class Store:
         _name(resource, "resource")
         try:
             ticket = int(ticket)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise BadRequest(f"ticket must be an integer: {ticket!r}") from None
         with self._tx() as now:
             self._sweep(now)
