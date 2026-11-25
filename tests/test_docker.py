@@ -34,7 +34,8 @@ def container():
     # shell values override a local .env (which may set a token or a LAN bind for the deployed instance);
     # own image tag so the test build never retags the deployed hwlock:latest
     env.update(HWLOCK_PUBLISH_PORT=str(port), HWLOCK_HEARTBEAT_S="60", HWLOCK_BIND="127.0.0.1",
-               HWLOCK_TOKEN="", HWLOCK_ADMIN_TOKEN="", HWLOCK_IMAGE="hwlock:test")
+               HWLOCK_TOKEN="", HWLOCK_ADMIN_TOKEN="", HWLOCK_IMAGE="hwlock:test",
+               HWLOCK_HEALTH_CONFIG="", HWLOCK_CONFIG_DIR=str(ROOT / "config"))
 
     def compose(*args, check=True):
         return subprocess.run(["docker", "compose", "-p", PROJECT, "-f", str(ROOT / "compose.yaml"), *args],

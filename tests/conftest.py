@@ -153,3 +153,114 @@ def wait_for(cond, timeout=10.0, step=0.05):
             return v
         time.sleep(step)
     raise AssertionError("condition not met within %.1fs" % timeout)
+
+
+EXPORTER = ROOT / "exporter" / "hwlock-exporter"
+
+
+class ExporterProc:
+    """A real hwlock-exporter process. It reads its proc/sys data from a directory the test controls (as
+    --proc/--sys/--boot-id-file allow), so a test can make the box "reboot" (new boot_id, small uptime)
+    or run low on memory, while everything from the exporter's HTTP answer onward is the real path."""
+
+    def __init__(self, tmp_path, name="exp"):
+        self.dir = tmp_path / name
+        self.proc, self.sys = self.dir / "proc", self.dir / "sys"
+        (self.proc / "sys/kernel/random").mkdir(parents=True)
+        for zone, typ, temp in (("thermal_zone0", "cpu-thermal", 45000), ("thermal_zone1", "gpu-thermal", 47500)):
+            (self.sys / "class/thermal" / zone).mkdir(parents=True)
+            (self.sys / "class/thermal" / zone / "type").write_text(typ + "\n")
+            (self.sys / "class/thermal" / zone / "temp").write_text(f"{temp}\n")
+        (self.sys / "devices/platform/bus@0/17000000.gpu").mkdir(parents=True)
+        (self.sys / "devices/platform/bus@0/17000000.gpu/load").write_text("155\n")
+        (self.proc / "loadavg").write_text("0.50 0.40 0.30 1/100 1234\n")
+        self.boot_id = "11111111-1111-1111-1111-111111111111"
+        self.write_boot(self.boot_id, uptime=5000)
+        self.set_mem_available(4000)
+        self.port = free_port()
+        self.url = f"http://127.0.0.1:{self.port}/"
+        self.log = self.dir / "exporter.log"
+        self.proc_handle = None
+
+    def write_boot(self, boot_id, uptime):
+        self.boot_id = boot_id
+        (self.proc / "sys/kernel/random/boot_id").write_text(boot_id + "\n")
+        (self.proc / "uptime").write_text(f"{uptime:.2f} 100.00\n")
+
+    def reboot(self, boot_id="22222222-2222-2222-2222-222222222222", uptime=0.5):
+        # the box rebooted "just now" (the exporter reads a fixed uptime, so keep it small: a reboot that
+        # claims to be older than the hold would rightly not void it)
+        self.write_boot(boot_id, uptime)
+
+    def set_mem_available(self, mb):
+        (self.proc / "meminfo").write_text(
+            f"MemTotal:        7599428 kB\nMemFree:          100000 kB\nMemAvailable:   {int(mb * 1024)} kB\n"
+            "SwapTotal:       4194300 kB\nSwapFree:        4194300 kB\n")
+
+    def start(self, *extra):
+        self.proc_handle = subprocess.Popen(
+            [sys.executable, str(EXPORTER), "--bind", "127.0.0.1", "--port", str(self.port), "--proc", str(self.proc),
+             "--sys", str(self.sys), "--nvpmodel-dir", str(self.dir / "nvpmodel"), *extra],
+            stdout=open(self.log, "a"), stderr=subprocess.STDOUT)
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(self.url, timeout=1) as r:
+                    if r.status == 200 or extra:
+                        return self
+            except urllib.error.HTTPError:
+                return self
+            except OSError:
+                time.sleep(0.05)
+        raise RuntimeError("exporter did not start: " + self.log.read_text())
+
+    def get(self):
+        with urllib.request.urlopen(self.url, timeout=2) as r:
+            return json.loads(r.read())
+
+    def kill(self):
+        if self.proc_handle and self.proc_handle.poll() is None:
+            self.proc_handle.send_signal(signal.SIGCONT)
+            self.proc_handle.kill()
+            self.proc_handle.wait()
+
+    def freeze(self):
+        """SIGSTOP: the kernel still accepts TCP connections on its socket, but nothing answers."""
+        self.proc_handle.send_signal(signal.SIGSTOP)
+
+    def thaw(self):
+        self.proc_handle.send_signal(signal.SIGCONT)
+
+
+@pytest.fixture
+def make_exporter(tmp_path):
+    made = []
+
+    def make(name="exp", start=True):
+        e = ExporterProc(tmp_path, name)
+        made.append(e)
+        return e.start() if start else e
+
+    yield make
+    for e in made:
+        e.kill()
+
+
+def health_config(tmp_path, resources: dict, name="health.json") -> str:
+    path = tmp_path / name
+    path.write_text(json.dumps({"resources": resources}))
+    return str(path)
+
+
+def exporter_resource(exp, *, on_fail="down", interval=0.2, down_after=3, up_after=2, degraded_after=2,
+                      timeout=0.5, degraded_if=None, extra_probes=()):
+    return {"interval_s": interval, "down_after": down_after, "up_after": up_after,
+            "degraded_after": degraded_after,
+            "probes": [{"type": "http_json", "url": exp.url, "timeout_s": timeout, "on_fail": on_fail,
+                        "degraded_if": degraded_if or {"mem_available_mb": "<800", "temp_max_c": ">85"}},
+                       *extra_probes]}
+
+
+def health_state(api, res="jetson"):
+    h = api.status(res).get("health") or {}
+    return h.get("state")
