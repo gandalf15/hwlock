@@ -13,6 +13,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 CLIENT = ROOT / "client" / "hwlock"
+# The client must also run on old Pythons (e.g. a Jetson); CI runs the CLI tests with python3.8 here.
+CLIENT_PYTHON = os.environ.get("HWLOCK_CLIENT_PYTHON", sys.executable)
 sys.path.insert(0, str(ROOT))
 
 
@@ -131,7 +133,7 @@ def run_client(server, *args, env=None, timeout=60, **kw):
         e["HWLOCK_TOKEN"] = server.api.token
     elif "HWLOCK_TOKEN" not in (env or {}):
         e.pop("HWLOCK_TOKEN", None)
-    return subprocess.run([sys.executable, str(CLIENT), *args], env=e, capture_output=True, text=True,
+    return subprocess.run([CLIENT_PYTHON, str(CLIENT), *args], env=e, capture_output=True, text=True,
                           timeout=timeout, **kw)
 
 
@@ -139,7 +141,7 @@ def popen_client(server, *args, env=None, **kw):
     e = {**os.environ, "HWLOCK_URL": server.url, **(env or {})}
     if server.api.token:
         e.setdefault("HWLOCK_TOKEN", server.api.token)
-    return subprocess.Popen([sys.executable, str(CLIENT), *args], env=e, stdout=subprocess.PIPE,
+    return subprocess.Popen([CLIENT_PYTHON, str(CLIENT), *args], env=e, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True, **kw)
 
 
