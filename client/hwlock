@@ -20,7 +20,8 @@ prints the queue position to stderr while waiting, and exits once you hold the l
 `hold` acquires and keeps renewing until file F exists (or Ctrl-C), then releases.
 Re-acquiring a resource you (same owner) already hold succeeds at once and refreshes the lease.
 
-Env: HWLOCK_URL (default http://127.0.0.1:8770), HWLOCK_TOKEN (bearer token, optional).
+Env: HWLOCK_URL (default http://127.0.0.1:8770), HWLOCK_TOKEN (bearer token, optional). Without them,
+`url=` and `token=` lines in ~/.config/hwlock/config (or $HWLOCK_CONFIG) are used.
 
 Exit codes: 0 ok | 1 not the holder / not held (renew, release, force-release) | 2 usage error |
 3 gave up after --max-wait | 4 server unreachable or rejected the request (auth, bad input) |
@@ -37,8 +38,28 @@ import time
 import urllib.error
 import urllib.request
 
-URL = os.environ.get("HWLOCK_URL", "http://127.0.0.1:8770").rstrip("/")
-TOKEN = os.environ.get("HWLOCK_TOKEN", "")
+
+
+def _config():
+    """Optional ~/.config/hwlock/config (or $HWLOCK_CONFIG) with `url=...` / `token=...` lines, so
+    agents' fresh non-interactive shells find the server without exporting anything. Env wins."""
+    path = os.environ.get("HWLOCK_CONFIG") or os.path.join(
+        os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "hwlock", "config")
+    conf = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                k, sep, v = line.strip().partition("=")
+                if sep and not k.startswith("#"):
+                    conf[k.strip().lower()] = v.strip()
+    except (OSError, UnicodeDecodeError):
+        pass
+    return conf
+
+
+_CONF = _config()
+URL = (os.environ.get("HWLOCK_URL") or _CONF.get("url") or "http://127.0.0.1:8770").rstrip("/")
+TOKEN = os.environ.get("HWLOCK_TOKEN") or _CONF.get("token") or ""
 LONG_POLL_S = float(os.environ.get("HWLOCK_LONG_POLL_S", "25"))
 EXIT_OK, EXIT_NOT_HOLDER, EXIT_USAGE, EXIT_TIMEOUT, EXIT_SERVER, EXIT_INT = 0, 1, 2, 3, 4, 130
 

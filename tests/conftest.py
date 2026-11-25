@@ -128,7 +128,7 @@ def api(server):
 
 
 def run_client(server, *args, env=None, timeout=60, **kw):
-    e = {**os.environ, "HWLOCK_URL": server.url, **(env or {})}
+    e = {**os.environ, "HWLOCK_URL": server.url, "HWLOCK_CONFIG": "/nonexistent", **(env or {})}
     if server.api.token and "HWLOCK_TOKEN" not in (env or {}):
         e["HWLOCK_TOKEN"] = server.api.token
     elif "HWLOCK_TOKEN" not in (env or {}):
@@ -138,7 +138,7 @@ def run_client(server, *args, env=None, timeout=60, **kw):
 
 
 def popen_client(server, *args, env=None, **kw):
-    e = {**os.environ, "HWLOCK_URL": server.url, **(env or {})}
+    e = {**os.environ, "HWLOCK_URL": server.url, "HWLOCK_CONFIG": "/nonexistent", **(env or {})}
     if server.api.token:
         e.setdefault("HWLOCK_TOKEN", server.api.token)
     return subprocess.Popen([CLIENT_PYTHON, str(CLIENT), *args], env=e, stdout=subprocess.PIPE,

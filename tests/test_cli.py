@@ -215,3 +215,13 @@ def test_waiting_client_reattaches_after_server_restart(make_server):
     assert p.returncode == 0, err
     assert "unreachable" in err and "rejoining" not in err
     assert api.events("jetson", {"acquire"})[-1]["ticket"] == ticket
+
+
+def test_config_file_supplies_url_and_token(make_server, tmp_path):
+    srv = make_server(HWLOCK_TOKEN="from-file")
+    conf = tmp_path / "config"
+    conf.write_text(f"# hwlock client config\nurl = {srv.url}\ntoken=from-file\n")
+    env = {"HWLOCK_CONFIG": str(conf), "HWLOCK_URL": "", "HWLOCK_TOKEN": ""}
+    r = run_client(srv, "acquire", "jetson", "cfg", env=env)
+    assert r.returncode == 0, r.stderr
+    assert srv.api.status("jetson")["holder"]["owner"] == "cfg"
