@@ -1,0 +1,15 @@
+{
+  "resources": {
+    "jetson": {
+      "interval_s": 5,
+      "down_after": 3,
+      "up_after": 2,
+      "degraded_after": 2,
+      "probes": [
+        {"type": "ssh_banner", "host": "192.168.0.99", "port": 22, "timeout_s": 3},
+        {"type": "http_json", "url": "http://192.168.0.99:8771/", "timeout_s": 3,
+         "degraded_if": {"mem_available_mb": "<800", "temp_max_c": ">85"}}
+      ]
+    }
+  }
+}

@@ -17,6 +17,9 @@ Routes (JSON in/out; all except /health need `Authorization: Bearer $HWLOCK_TOKE
   `attach`: an id each client process picks once; when given, a cancel/detach acts only if it comes from
   the ticket's (or grant's) latest client, else 200 {"state": "superseded"} (a re-run replaced it).
   POST /r/<resource>/force-release  {by, reason?}             200 | 409 not held  (admin; logged)
+  GET  /r/<resource>/health[?after=SEQ&wait=S]                health of a resource with probes (404 if none);
+         with `after`, long-polls until a health event newer than SEQ (health_up/degraded/down, rebooted,
+         lease_voided_reboot) and lists them
 """
 
 from __future__ import annotations
@@ -35,6 +38,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import __version__
 from .core import NAME_RE, BadRequest, HwlockError, Store
+from .health import Monitor, load_config_file
 
 
 class Config:
@@ -66,6 +70,8 @@ class Config:
         self.reattach_s = float(kw["reattach_s"] if "reattach_s" in kw else env("HWLOCK_REATTACH_S") or "120")
         if not self.reattach_s >= 0:
             raise ValueError("HWLOCK_REATTACH_S must be >= 0 (0 = drop a hung-up waiter's ticket at once)")
+        # health probes per resource (JSON file; see health.py). Unset or missing file = no health checks.
+        self.health_config = kw.get("health_config") or env("HWLOCK_HEALTH_CONFIG") or None
         if self.heartbeat_s < self.poll_s + 5:
             raise ValueError("HWLOCK_HEARTBEAT_S must be at least HWLOCK_POLL_S + 5 so a long-polling"
                              " waiter is never dropped")
@@ -141,6 +147,46 @@ def _guard_html(g) -> str:
             f" ({time.strftime('%H:%M:%S', time.localtime(g['evict_at']))})</span>")
 
 
+def _metrics_html(m) -> str:
+    """The exporter's main numbers, short."""
+    if not isinstance(m, dict):
+        return ""
+    bits = []
+    if isinstance(m.get("mem_available_mb"), (int, float)):
+        tot = m.get("mem_total_mb")
+        bits.append(f"mem free {m['mem_available_mb']:.0f}" + (f"/{tot:.0f}" if isinstance(tot, (int, float)) else "")
+                    + " MB")
+    if isinstance(m.get("load1"), (int, float)):
+        bits.append(f"load {m['load1']:.2f}")
+    if isinstance(m.get("temp_max_c"), (int, float)):
+        bits.append(f"max {m['temp_max_c']:.0f} °C")
+    if isinstance(m.get("gpu_load_pct"), (int, float)):
+        bits.append(f"GPU {m['gpu_load_pct']:.0f} %")
+    if isinstance(m.get("uptime_s"), (int, float)):
+        bits.append(f"up {_fmt_s(m['uptime_s'])}")
+    if m.get("nvpmodel"):
+        bits.append(html.escape(str(m["nvpmodel"])))
+    return " · ".join(bits)
+
+
+def _health_html(hv) -> str:
+    if not hv:
+        return "<span class=muted>no probes</span>"
+    e = html.escape
+    cls = {"up": "free", "degraded": "warn", "down": "down"}.get(hv["state"], "muted")
+    out = f"<b class={cls}>{e(hv['state'].upper())}</b> <small>for {_fmt_s(hv['for_s'])}</small>"
+    if hv.get("reason"):
+        out += f"<br><small>{e(hv['reason'])}</small>"
+    m = _metrics_html(hv.get("metrics"))
+    if m:
+        out += f"<br><small>{m}</small>"
+    if hv.get("last_reboot"):
+        out += f"<br><small>last reboot {time.strftime('%m-%d %H:%M', time.localtime(hv['last_reboot']))}</small>"
+    if hv.get("checked_s_ago") is not None:
+        out += f"<br><small>checked {_fmt_s(hv['checked_s_ago'])} ago</small>"
+    return out
+
+
 def render_html(status: dict, token_qs: str) -> str:
     e = html.escape
     rows = []
@@ -158,18 +204,19 @@ def render_html(status: dict, token_qs: str) -> str:
             f"<li class=muted>dormant: <b>{e(d['owner'])}</b> {e(d['reason'] or '')} <small>ticket"
             f" {d['ticket']} · re-attach within {_fmt_s(max(0, d['dormant_left_s']))} to get place"
             f" {d['position_on_reattach']} back</small></li>" for d in r.get("dormant", []))
-        rows.append(f"<tr><td><b>{e(r['resource'])}</b></td><td>{holder}</td><td><ol>{queue}</ol></td></tr>")
-    body = "".join(rows) or "<tr><td colspan=3 class=muted>no resources yet</td></tr>"
+        rows.append(f"<tr><td><b>{e(r['resource'])}</b></td><td>{_health_html(r.get('health'))}</td>"
+                    f"<td>{holder}</td><td><ol>{queue}</ol></td></tr>")
+    body = "".join(rows) or "<tr><td colspan=4 class=muted>no resources yet</td></tr>"
     return f"""<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width, initial-scale=1"><meta http-equiv=refresh content=3>
 <title>hwlock</title><style>
-:root{{--bg:#fff;--fg:#1d1d1f;--muted:#888;--line:#ddd;--ok:#1a7f37;--warn:#b35900}}
-@media (prefers-color-scheme: dark){{:root{{--bg:#141414;--fg:#eee;--muted:#999;--line:#333;--ok:#4ac26b;--warn:#f0a050}}}}
+:root{{--bg:#fff;--fg:#1d1d1f;--muted:#888;--line:#ddd;--ok:#1a7f37;--warn:#b35900;--bad:#c62828}}
+@media (prefers-color-scheme: dark){{:root{{--bg:#141414;--fg:#eee;--muted:#999;--line:#333;--ok:#4ac26b;--warn:#f0a050;--bad:#ff6b6b}}}}
 body{{background:var(--bg);color:var(--fg);font:15px/1.4 system-ui,sans-serif;margin:0;padding:16px}}
 table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid var(--line);padding:8px;
-text-align:left;vertical-align:top}}ol{{margin:0;padding:0;list-style:none}}.free{{color:var(--ok)}}.warn{{color:var(--warn)}}
+text-align:left;vertical-align:top}}ol{{margin:0;padding:0;list-style:none}}.free{{color:var(--ok)}}.warn{{color:var(--warn)}}.down{{color:var(--bad)}}
 .muted,small{{color:var(--muted)}}a{{color:inherit}}</style></head><body>
-<h1>hwlock</h1><table><tr><th>resource</th><th>holder</th><th>queue</th></tr>{body}</table>
+<h1>hwlock</h1><table><tr><th>resource</th><th>health</th><th>holder</th><th>queue</th></tr>{body}</table>
 <p class=muted>server time {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(status['now']))} ·
 refreshes every 3 s · <a href="/events{token_qs}">events</a> · <a href="/status{token_qs}">json</a></p>
 </body></html>"""
@@ -255,6 +302,8 @@ class Handler(BaseHTTPRequestHandler):
                 after = q("after")
                 return self._send(200, store.events(q("resource"), int(after) if after else None,
                                                     int(q("limit") or 100)))
+            if method == "GET" and len(parts) == 3 and parts[0] == "r" and parts[2] == "health":
+                return self._send(200, store.health(parts[1], q("after"), _wait(q("wait"), self.app.cfg.poll_s)))
             if method == "POST" and len(parts) == 3 and parts[0] == "r":
                 res, op, b = parts[1], parts[2], self._body()
                 if op == "acquire":
@@ -303,6 +352,10 @@ class App:
                            hold_grace_s=cfg.hold_grace_s, resource_max_hold_s=cfg.resource_max_hold_s,
                            resource_hold_grace_s=cfg.resource_hold_grace_s, reattach_s=cfg.reattach_s,
                            log=lambda m: print(f"hwlock: {m}", flush=True))
+        self.health = None
+        if cfg.health_config:
+            configs = load_config_file(cfg.health_config)  # a broken config stops the start (loudly)
+            self.health = Monitor(self.store, configs, log=lambda m: print(f"hwlock: {m}", flush=True))
         self.httpd = Server((cfg.host, cfg.port), Handler)
         self.httpd.app = self  # type: ignore[attr-defined]
         self._stop = threading.Event()
@@ -316,6 +369,14 @@ class App:
 
     def serve_forever(self):
         threading.Thread(target=self._sweeper, name="sweeper", daemon=True).start()
+        if self.health:
+            self.health.start()
+            for c in self.health.configs.values():
+                print(f"hwlock: health {c.name}: every {c.interval_s:g}s, down after {c.down_after}, up after"
+                      f" {c.up_after}, degraded after {c.degraded_after}: "
+                      + "; ".join(p.name + ("" if p.on_fail == "down" else " (failure = degraded)")
+                                  + "".join(f" degraded if {k}{op}{v:g}" for k, op, v in p.thresholds)
+                                  for p in c.probes), flush=True)
         print(f"hwlock {__version__} listening on http://{self.cfg.host}:{self.httpd.server_address[1]}"
               f" db={self.cfg.db} auth={'token' if self.cfg.token else 'none'}"
               f" max_hold={self.cfg.max_hold_s:g}s grace={self.cfg.hold_grace_s:g}s"
@@ -326,7 +387,11 @@ class App:
             self.httpd.serve_forever()
         finally:
             self._stop.set()
+            if self.health:
+                self.health.stop()
 
     def shutdown(self):
         self._stop.set()
+        if self.health:
+            self.health.stop()
         self.httpd.shutdown()

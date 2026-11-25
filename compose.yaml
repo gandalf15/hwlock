@@ -1,6 +1,8 @@
 # hwlock server. Default: reachable only from this machine (127.0.0.1:8770).
 # LAN:   HWLOCK_BIND=0.0.0.0 docker compose up -d     (set HWLOCK_TOKEN too!)
 # Settings can also live in a .env file next to this file (never commit it).
+# Health checks: put config/health.json (from config/health.example.json) and set
+#   HWLOCK_HEALTH_CONFIG=/config/health.json   in .env
 name: hwlock
 services:
   hwlock:
@@ -23,9 +25,13 @@ services:
       HWLOCK_HOLD_GRACE_S: ${HWLOCK_HOLD_GRACE_S:-300}
       HWLOCK_RESOURCE_MAX_HOLD_S: ${HWLOCK_RESOURCE_MAX_HOLD_S:-}
       HWLOCK_RESOURCE_HOLD_GRACE_S: ${HWLOCK_RESOURCE_HOLD_GRACE_S:-}
+      # hardware health probes (JSON, see config/health.example.json); empty = no health checks.
+      # The file lives in HWLOCK_CONFIG_DIR (default ./config), mounted read-only at /config.
+      HWLOCK_HEALTH_CONFIG: ${HWLOCK_HEALTH_CONFIG:-}
       TZ: ${TZ:-Etc/UTC}
     volumes:
       - hwlock-data:/data
+      - ${HWLOCK_CONFIG_DIR:-./config}:/config:ro
     stop_grace_period: 5s
 volumes:
   hwlock-data:

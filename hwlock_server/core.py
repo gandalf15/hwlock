@@ -73,7 +73,20 @@ CREATE TABLE IF NOT EXISTS events (
     detail   TEXT
 );
 CREATE INDEX IF NOT EXISTS events_resource ON events(resource, id);
+CREATE TABLE IF NOT EXISTS health (
+    resource       TEXT PRIMARY KEY,
+    state          TEXT NOT NULL,
+    since          REAL NOT NULL,
+    reason         TEXT,
+    boot_id        TEXT,
+    boot_ts        REAL,
+    last_reboot_ts REAL,
+    seq            INTEGER NOT NULL DEFAULT 0
+);
 """
+
+# events a health watcher (GET /r/<res>/health, hwlock watch, run/hold) is told about
+HEALTH_EVENTS = ("health_up", "health_degraded", "health_down", "rebooted", "lease_voided_reboot")
 
 
 class HwlockError(Exception):
@@ -103,6 +116,10 @@ class OverMaxHold(HwlockError):
 
 class TicketGone(HwlockError):
     status, code = 410, "ticket_gone"
+
+
+class NotFound(HwlockError):
+    status, code = 404, "not_found"
 
 
 def _name(value: Any, what: str) -> str:
@@ -165,6 +182,10 @@ class Store:
         self._dirty = False
         self.changes = 0  # bumped on every committed state change (wait()'s return value can miss one)
         self.cond = threading.Condition(self.lock)
+        # health: names of the resources with probes configured, and each one's latest round (in memory
+        # only: metrics change every few seconds, only transitions are written to the database)
+        self.health_names: set[str] = set()
+        self.health_live: dict[str, dict] = {}
         self.db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -217,15 +238,16 @@ class Store:
             self.changes += 1
             self.cond.notify_all()
 
-    def _event(self, now, resource, kind, owner=None, ticket=None, detail=None):
+    def _event(self, now, resource, kind, owner=None, ticket=None, detail=None) -> int:
         self._dirty = True
-        self.db.execute(
+        cur = self.db.execute(
             "INSERT INTO events(ts, resource, kind, owner, ticket, detail) VALUES (?,?,?,?,?,?)",
             (now, resource, kind, owner, ticket, json.dumps(detail) if detail is not None else None),
         )
         if self.log:
             extra = f" {json.dumps(detail)}" if detail else ""
             self.log(f"{kind} resource={resource} owner={owner} ticket={ticket}{extra}")
+        return cur.lastrowid
 
     def _lease(self, lease_s: Any) -> float:
         if lease_s is None:
@@ -463,7 +485,8 @@ class Store:
                 self._event(now, resource, "reacquire", owner, r["holder_ticket"], {"lease_s": lease})
                 r = self._resource(now, resource)
                 return {"state": "acquired", "resource": resource, "ticket": r["holder_ticket"],
-                        "reacquired": True, "holder": self._holder(r, now)}
+                        "reacquired": True, "holder": self._holder(r, now),
+                        "health": self._health_view(resource, now, full=False)}
             reattached = False
             if ticket is None:
                 mine = self.db.execute("SELECT * FROM tickets WHERE resource=? AND owner=? ORDER BY id",
@@ -502,7 +525,8 @@ class Store:
             first = self.db.execute(
                 "SELECT MIN(id) FROM tickets WHERE resource=? AND dormant_until IS NULL",
                 (resource,)).fetchone()[0]
-            if r["holder_owner"] is None and first == ticket:
+            paused = self._down(resource)  # never hand out a device that is down; the queue waits
+            if r["holder_owner"] is None and first == ticket and not paused:
                 if not may_grant():
                     # Its turn, but the client already hung up (killed, tool timeout): never hand the
                     # lock to a dead waiter; the ticket goes dormant so the next one is served now
@@ -524,8 +548,11 @@ class Store:
                              **({"max_hold_s": max_hold} if max_hold else {})})
                 r = self._resource(now, resource)
                 return {"state": "acquired", "resource": resource, "ticket": ticket,
-                        "reacquired": False, "reattached": reattached, "holder": self._holder(r, now)}
+                        "reacquired": False, "reattached": reattached, "holder": self._holder(r, now),
+                        "health": self._health_view(resource, now, full=False)}
             return {"state": "waiting", "resource": resource, "ticket": ticket, "reattached": reattached,
+                    "health": self._health_view(resource, now, full=False),
+                    **({"paused": "down"} if paused and r["holder_owner"] is None and first == ticket else {}),
                     "position": self._position(resource, ticket),
                     "queue_length": self.db.execute(
                         "SELECT COUNT(*) FROM tickets WHERE resource=? AND dormant_until IS NULL",
@@ -549,7 +576,9 @@ class Store:
         touch_s = max(0.05, self.heartbeat_s / 4)
 
         def view(r):
-            return r.get("position"), (r.get("holder") or {}).get("owner")
+            # a health change (down, back up, rebooted) also ends the poll: waiters learn of it at once
+            return (r.get("position"), (r.get("holder") or {}).get("owner"), (r.get("health") or {}).get("seq"),
+                    r.get("paused"))
 
         with self.cond:
             res = self.acquire_step(resource, owner, may_grant=may_grant, **kw)
@@ -644,14 +673,14 @@ class Store:
             self._sweep(now)
             r = self._resource(now, resource, create=False)
             if r is None or r["holder_owner"] != owner:
-                raise NotHolder(f"{owner} does not hold {resource}",
-                                holder=self._holder(r, now))
+                raise self._not_holder(r, resource, owner, now)
             self._check_max_hold(r, now)
             self.db.execute("UPDATE resources SET expires=?, lease_s=? WHERE name=?",
                             (now + lease, lease, resource))
             self._event(now, resource, "renew", owner, r["holder_ticket"], {"lease_s": lease})
             return {"state": "renewed", "resource": resource,
-                    "holder": self._holder(self._resource(now, resource), now)}
+                    "holder": self._holder(self._resource(now, resource), now),
+                    "health": self._health_view(resource, now, full=False)}
 
     def _clear(self, resource):
         self.db.execute(
@@ -667,7 +696,7 @@ class Store:
             self._sweep(now)
             r = self._resource(now, resource, create=False)
             if r is None or r["holder_owner"] != owner:
-                raise NotHolder(f"{owner} does not hold {resource}", holder=self._holder(r, now))
+                raise self._not_holder(r, resource, owner, now)
             self._clear(resource)
             self._event(now, resource, "release", owner, r["holder_ticket"],
                         {"held_s": round(now - r["since"], 3)})
@@ -717,6 +746,147 @@ class Store:
                 return {"state": "released", "resource": resource, "ticket": ticket}
             return {"state": "unknown", "resource": resource, "ticket": ticket}
 
+    # ------------------------------------------------------------------ health
+    def health_register(self, names) -> None:
+        """Resources with health probes: they get a resource row (so they show in status even if never
+        acquired) and a health row (state "unknown" until the probes decide; a persisted state is kept)."""
+        names = [_name(n, "resource") for n in names]
+        with self._tx() as now:
+            for n in names:
+                self._resource(now, n)
+                self.db.execute("INSERT OR IGNORE INTO health(resource, state, since) VALUES (?, 'unknown', ?)",
+                                (n, now))
+        with self.lock:
+            self.health_names = set(names)
+
+    def health_state(self, resource) -> str:
+        with self.lock:
+            row = self.db.execute("SELECT state FROM health WHERE resource=?", (resource,)).fetchone()
+            return row["state"] if row else "unknown"
+
+    def _health_row(self, resource):
+        if resource not in self.health_names:
+            return None
+        return self.db.execute("SELECT * FROM health WHERE resource=?", (resource,)).fetchone()
+
+    def _down(self, resource) -> bool:
+        h = self._health_row(resource)
+        return h is not None and h["state"] == "down"
+
+    def _health_view(self, resource, now, full=True) -> dict | None:
+        """The resource's health for answers: state, since, reason, last reboot, `seq` (id of the latest
+        health event: a watcher waits for it to grow); with full=True also the latest round's metrics."""
+        h = self._health_row(resource)
+        if h is None:
+            return None
+        v = {"state": h["state"], "since": h["since"], "for_s": round(now - h["since"], 3),
+             "reason": h["reason"], "seq": h["seq"], "boot_id": h["boot_id"],
+             "last_reboot": h["last_reboot_ts"]}
+        if full:
+            live = self.health_live.get(resource) or {}
+            v.update({k: live.get(k) for k in ("checked_at", "outcome", "round_reason", "probes", "metrics",
+                                                "hysteresis")})
+            if live.get("checked_at"):
+                v["checked_s_ago"] = round(now - live["checked_at"], 3)
+        return v
+
+    def health_report(self, resource, *, outcome, new_state=None, reason="", probes=None, metrics=None,
+                      boot=None, hysteresis=None) -> None:
+        """One probe round's result from the Monitor. Writes only on a transition (new_state), a reboot
+        (boot_id changed) or the first boot_id ever seen; otherwise only the in-memory latest round."""
+        with self.lock:
+            now = self.clock()
+            self.health_live[resource] = {"checked_at": now, "outcome": outcome, "round_reason": reason or None,
+                                          "probes": probes, "metrics": metrics, "hysteresis": hysteresis}
+            h = self.db.execute("SELECT * FROM health WHERE resource=?", (resource,)).fetchone()
+            if h is None:
+                return
+            rebooted = bool(boot and h["boot_id"] and boot["boot_id"] != h["boot_id"])
+            first_boot = bool(boot and not h["boot_id"])
+            if not (new_state or rebooted or first_boot):
+                return
+            with self._tx() as now:
+                seq = h["seq"]
+                if boot and (rebooted or first_boot):
+                    up = boot.get("uptime_s")
+                    boot_ts = now - up if isinstance(up, (int, float)) else now
+                    self.db.execute("UPDATE health SET boot_id=?, boot_ts=? WHERE resource=?",
+                                    (boot["boot_id"], boot_ts, resource))
+                    if rebooted:
+                        seq = self._rebooted(now, resource, h["boot_id"], boot, boot_ts)
+                if new_state and new_state != h["state"]:
+                    seq = self._event(now, resource, f"health_{new_state}", detail={
+                        "from": h["state"], "to": new_state, "reason": reason or None,
+                        "was_for_s": round(now - h["since"], 3)})
+                    self.db.execute("UPDATE health SET state=?, since=?, reason=? WHERE resource=?",
+                                    (new_state, now, reason or None, resource))
+                self.db.execute("UPDATE health SET seq=? WHERE resource=?", (seq, resource))
+
+    def _rebooted(self, now, resource, old_boot, boot, boot_ts) -> int:
+        """The device came back with a new boot id: log it and void the holder's lease if it was taken
+        before that boot (its work on the device is gone). Waiters keep their tickets and FIFO order."""
+        seq = self._event(now, resource, "rebooted", detail={
+            "old_boot_id": old_boot, "boot_id": boot["boot_id"], "uptime_s": boot.get("uptime_s"),
+            "booted_at": round(boot_ts, 3)})
+        self.db.execute("UPDATE health SET last_reboot_ts=? WHERE resource=?", (boot_ts, resource))
+        r = self._resource(now, resource, create=False)
+        # a holder that took the lock after the boot (e.g. while the exporter was still starting) keeps it
+        if r is not None and r["holder_owner"] is not None and r["since"] < boot_ts + 2:
+            self._clear(resource)
+            seq = self._event(now, resource, "lease_voided_reboot", r["holder_owner"], r["holder_ticket"], {
+                "held_s": round(now - r["since"], 3), "old_boot_id": old_boot, "boot_id": boot["boot_id"],
+                "booted_at": round(boot_ts, 3)})
+        return seq
+
+    def _voided(self, resource, owner) -> dict | None:
+        """If `owner`'s last lock on `resource` ended because the device rebooted: that event's detail."""
+        e = self.db.execute(
+            "SELECT kind, ts, detail FROM events WHERE resource=? AND owner=? AND kind IN"
+            " ('acquire', 'reacquire', 'lease_voided_reboot') ORDER BY id DESC LIMIT 1",
+            (resource, owner)).fetchone()
+        if e is None or e["kind"] != "lease_voided_reboot":
+            return None
+        return {"why": "reboot", "at": e["ts"], **json.loads(e["detail"] or "{}")}
+
+    def _not_holder(self, r, resource, owner, now):
+        voided = self._voided(resource, owner)
+        if voided:
+            return NotHolder(f"{owner}'s lease on {resource} was voided: the device rebooted", voided=voided,
+                             holder=self._holder(r, now), health=self._health_view(resource, now, full=False))
+        return NotHolder(f"{owner} does not hold {resource}", holder=self._holder(r, now))
+
+    def health(self, resource, after=None, wait_s: float = 0) -> dict:
+        """Health of a configured resource. With `after` (a seq), long-polls up to wait_s until a health
+        event newer than it exists, and lists those events (health_*, rebooted, lease_voided_reboot)."""
+        _name(resource, "resource")
+        if after is not None:
+            try:
+                after = int(after)
+            except (TypeError, ValueError, OverflowError):
+                raise BadRequest(f"after must be an integer: {after!r}") from None
+        deadline = time.monotonic() + max(0.0, float(wait_s))
+        with self.cond:
+            if resource not in self.health_names:
+                raise NotFound(f"no health probes are configured for {resource}", resource=resource)
+            while True:
+                v = self._health_view(resource, self.clock())
+                left = deadline - time.monotonic()
+                if after is None or v["seq"] > after or left <= 0:
+                    break
+                self.cond.wait(min(left, 1.0))
+            events = []
+            if after is not None and v["seq"] > after:
+                q = ",".join("?" * len(HEALTH_EVENTS))
+                events = [{"id": e["id"], "ts": e["ts"], "kind": e["kind"], "owner": e["owner"],
+                           "detail": json.loads(e["detail"]) if e["detail"] else None}
+                          for e in self.db.execute(
+                              f"SELECT * FROM events WHERE resource=? AND id>? AND kind IN ({q}) ORDER BY id",
+                              (resource, after, *HEALTH_EVENTS)).fetchall()]
+            now = self.clock()
+            r = self._resource(now, resource, create=False)
+            return {"resource": resource, "now": now, "health": v, "events": events,
+                    "holder": self._holder(r, now)}
+
     # ------------------------------------------------------------------ queries
     def _resource_status(self, r, now) -> dict:
         queue, dormant = [], []
@@ -730,7 +900,8 @@ class Store:
                 dormant.append({**e, "position_on_reattach": len(queue) + 1,
                                 "dormant_left_s": round(t["dormant_until"] - now, 3)})
         return {"resource": r["name"], "free": r["holder_owner"] is None,
-                "holder": self._holder(r, now), "queue": queue, "dormant": dormant}
+                "holder": self._holder(r, now), "queue": queue, "dormant": dormant,
+                "health": self._health_view(r["name"], now)}
 
     def status(self, resource: str | None = None) -> dict:
         with self.lock:
@@ -741,7 +912,7 @@ class Store:
                 r = self.db.execute("SELECT * FROM resources WHERE name=?", (resource,)).fetchone()
                 if r is None:
                     return {"now": now, "resource": resource, "free": True, "holder": None, "queue": [],
-                            "dormant": []}
+                            "dormant": [], "health": None}
                 return {"now": now, **self._resource_status(r, now)}
             rows = self.db.execute("SELECT * FROM resources ORDER BY name").fetchall()
             return {"now": now, "resources": [self._resource_status(r, now) for r in rows]}

@@ -7,3 +7,5 @@ __pycache__/
 *.db-shm
 .env
 data/
+config/*.json
+!config/health.example.json
