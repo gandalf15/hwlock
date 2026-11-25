@@ -126,15 +126,19 @@ def test_run_auto_renews_and_releases(server):
                      sys.executable, "-c", "import time; time.sleep(5)")
     wait_for(lambda: holder(api) == "runner")
     t0 = time.monotonic()
-    while p.poll() is None:  # lease is 2 s, the job takes 5 s: it must stay held throughout
+    # lease is 2 s, the job takes 5 s: it must stay held while the job runs (checked until 4.5 s;
+    # the release right at the end may be seen before the client process has exited)
+    while time.monotonic() - t0 < 4.5:
         h = api.status("jetson")["holder"]
         assert h and h["owner"] == "runner", f"lost the lock after {time.monotonic() - t0:.1f}s"
         time.sleep(0.2)
+    p.wait(10)
     assert p.returncode == 0
     assert holder(api) is None
-    kinds = [e["kind"] for e in api.events("jetson")]
+    ev = api.events("jetson")
+    kinds = [e["kind"] for e in ev]
     assert kinds.count("renew") >= 4 and "expire" not in kinds
-    assert kinds[-1] == "release"
+    assert kinds[-1] == "release" and ev[-1]["detail"]["held_s"] >= 5
 
 
 def test_run_releases_on_failure_and_returns_exit_code(server):
