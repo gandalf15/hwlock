@@ -9,7 +9,10 @@
 #
 # Env: HWLOCK_URL (default http://127.0.0.1:8770), HWLOCK_TOKEN.
 # Exit: 0 ok, 1 not holder, 4 server error, 5 OVER_MAX_HOLD (renew refused: held past the server's max
-# hold while others wait; release soon, you are evicted after the grace period).
+# hold while others wait; release soon, you are evicted after the grace period), 130 Ctrl-C while waiting
+# (ticket cancelled), 143 SIGTERM while waiting (ticket kept: re-run the same acquire within the server's
+# re-attach window, default 120 s, to get the place back; bash handles the TERM once the current long-poll
+# returns, at most ~25 s).
 set -euo pipefail
 URL=${HWLOCK_URL:-http://127.0.0.1:8770}
 auth=(); [[ -n ${HWLOCK_TOKEN:-} ]] && auth=(-H "Authorization: Bearer $HWLOCK_TOKEN")
@@ -33,7 +36,8 @@ acquire)
             200) echo "hwlock: $owner holds $res"; exit 0 ;;
             202) ticket=$(field ticket "$json"); msg="waiting for $res: position $(field position "$json"), ticket $ticket"
                  [[ $msg != "$last" ]] && echo "hwlock: $msg" >&2; last=$msg
-                 trap 'post "/r/$res/cancel" "{\"ticket\": $ticket}" >/dev/null; exit 130' INT TERM
+                 trap 'post "/r/$res/cancel" "{\"ticket\": $ticket}" >/dev/null; exit 130' INT
+                 trap 'post "/r/$res/detach" "{\"ticket\": $ticket}" >/dev/null; echo "hwlock: SIGTERM; ticket $ticket kept for re-attach" >&2; exit 143' TERM
                  r=$(post "/r/$res/acquire" "{$body, \"ticket\": $ticket, \"wait\": 25}" 40) ;;
             410) r=$(post "/r/$res/acquire" "{$body, \"wait\": 0}") ;;   # ticket dropped: rejoin
             409) echo "OVER_MAX_HOLD waiting=$(field waiting "$json") evict_in=$(field evict_in_s "$json" | cut -d. -f1)"; exit 5 ;;
@@ -51,5 +55,5 @@ renew|release)
                        echo "NOT_HOLDER holder=$(field owner "${r#* }")"; exit 1 ;;
                   *) echo "hwlock: server said ${r}" >&2; exit 4 ;; esac ;;
 status) curl -sS -m 15 "${auth[@]}" "$URL/status${1:+/$1}"; echo ;;
-*) sed -n '2,12p' "$0"; exit 2 ;;
+*) sed -n '2,16p' "$0"; exit 2 ;;
 esac

@@ -100,3 +100,28 @@ def test_over_max_hold_exit_5_in_bash_client_and_wrapper(make_server):
     r = sh(server, "renew", "jetson", "nobody")
     assert r.returncode == 1 and r.stdout.strip() == "NOT_HOLDER holder=job-a"
     api.post("/r/jetson/cancel", {"ticket": ticket})
+
+
+def test_bash_client_sigterm_keeps_the_ticket_and_a_rerun_reattaches(make_server):
+    srv = make_server(HWLOCK_POLL_S="1", HWLOCK_HEARTBEAT_S="10")
+    api = srv.api
+    e = {**os.environ, "HWLOCK_URL": srv.url}
+    assert sh(srv, "acquire", "jetson", "holder").returncode == 0
+    early = subprocess.Popen(["bash", str(SH), "acquire", "jetson", "early"], env=e, text=True,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    wait_for(lambda: api.status("jetson")["queue"])
+    t = api.status("jetson")["queue"][0]["ticket"]
+    time.sleep(0.5)
+    early.send_signal(15)
+    assert early.wait(15) == 143
+    assert [d["ticket"] for d in api.status("jetson")["dormant"]] == [t]
+    late = subprocess.Popen(["bash", str(SH), "acquire", "jetson", "late"], env=e, text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    wait_for(lambda: api.status("jetson")["queue"])
+    again = subprocess.Popen(["bash", str(SH), "acquire", "jetson", "early"], env=e, text=True,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    wait_for(lambda: [q["owner"] for q in api.status("jetson")["queue"]] == ["early", "late"])
+    assert sh(srv, "release", "jetson", "holder").returncode == 0
+    assert again.wait(15) == 0 and api.status("jetson")["holder"]["ticket"] == t
+    assert sh(srv, "release", "jetson", "early").returncode == 0
+    assert late.wait(15) == 0

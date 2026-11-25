@@ -4,13 +4,14 @@
 One holder per resource, a FIFO queue, leases. Talks to an hwlock server (HWLOCK_URL).
 Single file, Python >= 3.8 standard library only: copy it anywhere.
 
-  hwlock acquire <resource> <owner> [reason] [--lease S] [--max-wait S] [--max-hold S]
+  hwlock acquire <resource> <owner> [reason] [--lease S] [--max-wait S] [--max-hold S] [--new-ticket]
   hwlock renew   <resource> <owner> [--lease S]
   hwlock release <resource> <owner>
   hwlock status  [resource] [--json]
   hwlock run     <resource> <owner> [reason] [--lease S] [--max-wait S] [--max-hold S]
-                 [--kill-on-preempt] -- <cmd...>
+                 [--new-ticket] [--kill-on-preempt] -- <cmd...>
   hwlock hold    <resource> <owner> [reason] --until-file F [--lease S] [--max-wait S] [--max-hold S]
+                 [--new-ticket]
   hwlock events  [resource] [--limit N] [--json]
   hwlock force-release <resource> <by> [reason]          (admin; logged)
 
@@ -20,6 +21,14 @@ prints the queue position to stderr while waiting, and exits once you hold the l
 `run` acquires, renews in the background while <cmd> runs, and releases on exit, failure or Ctrl-C.
 `hold` acquires and keeps renewing until file F exists (or Ctrl-C), then releases.
 Re-acquiring a resource you (same owner) already hold succeeds at once and refreshes the lease.
+
+Keeping your place: SIGTERM while waiting (a tool timeout, `timeout`, `kill`) keeps the ticket: it
+turns dormant on the server for its re-attach window (HWLOCK_REATTACH_S, default 120 s) and the
+client exits 143. Re-running the same acquire (same resource and owner) within that window re-attaches
+to it and gets its place back. A dormant ticket is skipped while dormant, so it never blocks anyone.
+Ctrl-C (SIGINT) gives the place up (the ticket is cancelled, exit 130). --new-ticket drops any old
+ticket of this owner and joins at the back. Two clients waiting at once with the same owner share
+one ticket (and both get the lock): use a unique owner per job.
 
 Starvation guard (server HWLOCK_MAX_HOLD_S, default 2 h): while others wait, nobody may keep a
 resource longer than that from when they took it. Past it, renew/re-acquire is refused
@@ -36,7 +45,8 @@ Env: HWLOCK_URL (default http://127.0.0.1:8770), HWLOCK_TOKEN (bearer token, opt
 Exit codes: 0 ok | 1 not the holder / not held (renew, release, force-release) | 2 usage error |
 3 gave up after --max-wait | 4 server unreachable or rejected the request (auth, bad input) |
 5 OVER_MAX_HOLD: renew/re-acquire refused, held past the max hold while others wait; `hold` lost the
-lock that way; `run --kill-on-preempt` stopped the command | 130 interrupted while waiting |
+lock that way; `run --kill-on-preempt` stopped the command | 130 Ctrl-C while waiting (ticket
+cancelled) | 143 SIGTERM while waiting (ticket kept for re-attach) |
 run: the command's exit code (128+N if killed by signal N).
 """
 
@@ -74,6 +84,7 @@ URL = (os.environ.get("HWLOCK_URL") or _CONF.get("url") or "http://127.0.0.1:877
 TOKEN = os.environ.get("HWLOCK_TOKEN") or _CONF.get("token") or ""
 LONG_POLL_S = float(os.environ.get("HWLOCK_LONG_POLL_S", "25"))
 EXIT_OK, EXIT_NOT_HOLDER, EXIT_USAGE, EXIT_TIMEOUT, EXIT_SERVER, EXIT_PREEMPTED, EXIT_INT = 0, 1, 2, 3, 4, 5, 130
+EXIT_TERM = 143
 KILL_AFTER_S = 10.0  # run --kill-on-preempt: SIGTERM, then SIGKILL this much later
 
 
@@ -88,6 +99,10 @@ class ServerError(Exception):
 
 class Unreachable(Exception):
     pass
+
+
+class Terminated(BaseException):
+    """SIGTERM while waiting (BaseException: must not be swallowed as a network error)."""
 
 
 def say(msg):
@@ -155,9 +170,11 @@ def server_error_exit(err):
 class Acquirer(object):
     """Takes a ticket and long-polls until granted. Survives server restarts (re-attaches by ticket)."""
 
-    def __init__(self, resource, owner, reason=None, lease=None, max_wait=None, pid=None, max_hold=None):
+    def __init__(self, resource, owner, reason=None, lease=None, max_wait=None, pid=None, max_hold=None,
+                 new_ticket=False):
         self.resource, self.owner, self.reason = resource, owner, reason
         self.lease, self.max_wait, self.max_hold = lease, max_wait, max_hold
+        self.new_ticket = new_ticket  # only on the first request: drop our old ticket, join at the back
         self.pid = pid if pid is not None else os.getppid()
         self.ticket = None
         self.granted = False
@@ -171,6 +188,8 @@ class Acquirer(object):
             b["max_hold"] = self.max_hold
         if self.ticket is not None:
             b["ticket"] = self.ticket
+        elif self.new_ticket:
+            b["new_ticket"] = True
         return b
 
     def run(self):
@@ -205,14 +224,19 @@ class Acquirer(object):
                 time.sleep(backoff)
                 backoff = min(backoff * 1.5, 5.0)
                 continue
+            if self.ticket is None and out.get("reattached"):
+                say("re-attached to ticket %s (kept its place in the queue)" % out.get("ticket"))
+            self.new_ticket = False
             self.ticket = out.get("ticket")
             if out.get("state") == "acquired":
                 self.granted = True
                 return out
             h = out.get("holder")
-            msg = "waiting for %s: position %s of %s, ticket %s, holder %s" % (
+            msg = "waiting for %s: position %s of %s, ticket %s, holder %s%s" % (
                 self.resource, out.get("position"), out.get("queue_length"), self.ticket,
-                ("%s%s" % (h["owner"], (": " + h["reason"]) if h.get("reason") else "")) if h else "none")
+                ("%s%s" % (h["owner"], (": " + h["reason"]) if h.get("reason") else "")) if h else "none",
+                " (%s dormant ticket(s) ahead, skipped unless re-attached)" % out["dormant_ahead"]
+                if out.get("dormant_ahead") else "")
             if msg != last_msg:
                 say(msg)
                 last_msg = msg
@@ -227,20 +251,46 @@ class Acquirer(object):
         except Exception:
             pass
 
+    def detach(self):
+        """Keep our place: the server makes our ticket dormant for its re-attach window (also releases
+        if it was granted in the meantime). Without a ticket id yet, detach by owner (never releases)."""
+        body = {"owner": self.owner}
+        if self.ticket is not None:
+            body["ticket"] = self.ticket
+        try:
+            _, out = call("POST", "/r/%s/detach" % self.resource, body, timeout=3)
+            return out
+        except BaseException:
+            return None
 
-def acquire_or_exit(resource, owner, reason, lease, max_wait, pid=None, max_hold=None):
-    acq = Acquirer(resource, owner, reason, lease, max_wait, pid, max_hold)
 
-    def interrupted(_signum, _frame):
-        raise KeyboardInterrupt
+def acquire_or_exit(resource, owner, reason, lease, max_wait, pid=None, max_hold=None, new_ticket=False):
+    acq = Acquirer(resource, owner, reason, lease, max_wait, pid, max_hold, new_ticket)
 
-    old = signal.signal(signal.SIGTERM, interrupted)
+    def terminated(_signum, _frame):
+        raise Terminated()
+
+    old = signal.signal(signal.SIGTERM, terminated)
     try:
         return acq.run()
     except KeyboardInterrupt:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
         acq.cancel()
         say("interrupted; ticket withdrawn")
         sys.exit(EXIT_INT)
+    except Terminated:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)  # a second TERM must not cut the detach short
+        out = acq.detach() or {}
+        if out.get("state") == "released":
+            say("terminated (SIGTERM); the lock had just been granted and is released again")
+        elif out.get("state") == "dormant":
+            say("terminated (SIGTERM); ticket %s kept for %s: re-run the same acquire (same resource and"
+                " owner) within that time to get your place back (Ctrl-C would have given it up)"
+                % (out.get("ticket"), fmt_s(out.get("window_s"))))
+        else:
+            say("terminated (SIGTERM); ticket %s kept if the server saw it: re-run the same acquire soon"
+                " to get your place back" % acq.ticket)
+        sys.exit(EXIT_TERM)
     finally:
         signal.signal(signal.SIGTERM, old)
 
@@ -397,9 +447,10 @@ def guard_text(g):
 
 
 def cmd_acquire(args):
-    (res, owner, *rest), o, _ = parse(args, 2, 3, {"lease": float, "max-wait": float, "max-hold": float})
+    (res, owner, *rest), o, _ = parse(args, 2, 3, {"lease": float, "max-wait": float, "max-hold": float,
+                                                   "new-ticket": bool})
     out = acquire_or_exit(res, owner, rest[0] if rest else None, o.get("lease"), o.get("max-wait"),
-                          max_hold=o.get("max-hold"))
+                          max_hold=o.get("max-hold"), new_ticket=o.get("new-ticket", False))
     print("hwlock: " + acquired_msg(out, owner))
     return EXIT_OK
 
@@ -460,6 +511,10 @@ def cmd_status(args):
         for q in r["queue"]:
             print("  %d. %s  waiting %s  ticket %s  %s" % (q["position"], q["owner"], fmt_s(q["waiting_s"]),
                                                        q["ticket"], q.get("reason") or ""))
+        for d in r.get("dormant") or []:
+            print("  -  %s  DORMANT (client gone; re-attach within %s to get place %s back)  ticket %s  %s" % (
+                d["owner"], fmt_s(max(0, d["dormant_left_s"])), d["position_on_reattach"], d["ticket"],
+                d.get("reason") or ""))
     return EXIT_OK
 
 
@@ -476,7 +531,7 @@ def cmd_events(args):
         print(json.dumps(out, indent=2))
         return EXIT_OK
     for e in out["events"]:
-        print("%s  %-14s %-12s %-20s %s" % (time.strftime("%m-%d %H:%M:%S", time.localtime(e["ts"])),
+        print("%s  %-17s %-12s %-20s %s" % (time.strftime("%m-%d %H:%M:%S", time.localtime(e["ts"])),
                                            e["kind"], e["resource"] or "", e["owner"] or "",
                                            json.dumps(e["detail"]) if e["detail"] else ""))
     return EXIT_OK
@@ -500,7 +555,7 @@ def _lease_of(out, requested):
 
 def cmd_run(args):
     pos, o, cmd = parse(args, 2, 3, {"lease": float, "max-wait": float, "max-hold": float,
-                                     "kill-on-preempt": bool}, allow_dashdash=True)
+                                     "kill-on-preempt": bool, "new-ticket": bool}, allow_dashdash=True)
     if not cmd:
         die("usage: hwlock run <resource> <owner> [reason] -- <cmd...>")
     res, owner = pos[0], pos[1]
@@ -508,7 +563,7 @@ def cmd_run(args):
     import subprocess
 
     out = acquire_or_exit(res, owner, pos[2] if len(pos) > 2 else None, o.get("lease"), o.get("max-wait"),
-                          pid=os.getpid(), max_hold=o.get("max-hold"))
+                          pid=os.getpid(), max_hold=o.get("max-hold"), new_ticket=o.get("new-ticket", False))
     say(acquired_msg(out, owner))
     child = None
     old = {}
@@ -594,12 +649,12 @@ def cmd_run(args):
 
 def cmd_hold(args):
     pos, o, _ = parse(args, 2, 3, {"lease": float, "max-wait": float, "max-hold": float, "until-file": str,
-                                   "poll": float})
+                                   "poll": float, "new-ticket": bool})
     if "until-file" not in o:
         die("usage: hwlock hold <resource> <owner> [reason] --until-file F")
     res, owner, until = pos[0], pos[1], o["until-file"]
     out = acquire_or_exit(res, owner, pos[2] if len(pos) > 2 else None, o.get("lease"), o.get("max-wait"),
-                          pid=os.getpid(), max_hold=o.get("max-hold"))
+                          pid=os.getpid(), max_hold=o.get("max-hold"), new_ticket=o.get("new-ticket", False))
     say(acquired_msg(out, owner) + "; holding until %s exists" % until)
     stop = threading.Event()
     renewer = Renewer(res, owner, _lease_of(out, o.get("lease")), (out.get("holder") or {}).get("guard"),

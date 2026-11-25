@@ -92,15 +92,17 @@ def test_max_wait_gives_up_with_exit_3_and_cancels_ticket(server):
 
 
 def test_interrupt_while_waiting_cancels_ticket(server):
+    """Ctrl-C (SIGINT) gives the place up. (SIGTERM keeps it: test_sigterm_keeps_the_ticket_ctrl_c_cancels_it.)"""
     run_client(server, "acquire", "jetson", "a")
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    for _ in range(2):
         p = popen_client(server, "acquire", "jetson", "b")
         wait_for(lambda: server.api.status("jetson")["queue"])
         time.sleep(0.3)
-        p.send_signal(sig)
+        p.send_signal(signal.SIGINT)
         p.wait(10)
         assert p.returncode == 130
         assert server.api.status("jetson")["queue"] == []
+        assert server.api.status("jetson")["dormant"] == []
     assert holder(server.api) == "a"
 
 
@@ -384,3 +386,119 @@ def test_acquire_max_hold_flag(make_server):
     r = run_client(server, "acquire", "jetson", "a", "--max-hold", "30")
     assert r.returncode == 0 and "max hold 30s while others wait" in r.stdout, r.stdout
     assert server.api.status("jetson")["holder"]["guard"]["max_hold_s"] == 30
+
+
+def queue_owners(api, res="jetson"):
+    return [q["owner"] for q in api.status(res)["queue"]]
+
+
+def test_killed_acquire_keeps_its_place(server):
+    """The reproduction (2026-11-25): an agent's `acquire` is killed by a tool timeout (SIGTERM, like
+    `timeout -s TERM 4 hwlock acquire ...`), a later job starts waiting, then the agent simply re-runs the
+    same acquire as a new process. It must keep its original place, ahead of the later job."""
+    api = server.api
+    assert run_client(server, "acquire", "jetson", "holder").returncode == 0
+    early = popen_client(server, "acquire", "jetson", "early", env=FAST)
+    wait_for(lambda: queue_owners(api) == ["early"])
+    t_early = api.status("jetson")["queue"][0]["ticket"]
+    time.sleep(0.3)
+    early.send_signal(signal.SIGTERM)  # the tool timeout
+    early.wait(10)
+    late = popen_client(server, "acquire", "jetson", "late", env=FAST)
+    wait_for(lambda: "late" in queue_owners(api))
+    t_late = [q["ticket"] for q in api.status("jetson")["queue"] if q["owner"] == "late"][0]
+    again = popen_client(server, "acquire", "jetson", "early", env=FAST)  # re-run: a new process
+    wait_for(lambda: len(api.status("jetson")["queue"]) == 2)
+    time.sleep(0.5)
+    q = api.status("jetson")["queue"]
+    assert [(x["owner"], x["ticket"]) for x in q] == [("early", t_early), ("late", t_late)], q
+    assert t_early < t_late
+    assert run_client(server, "release", "jetson", "holder").returncode == 0
+    assert again.wait(10) == 0, again.stderr.read()
+    assert holder(api) == "early"
+    assert api.events("jetson", {"acquire"})[-1]["ticket"] == t_early
+    assert late.poll() is None
+    assert run_client(server, "release", "jetson", "early").returncode == 0
+    assert late.wait(10) == 0 and holder(api) == "late"
+    # how it got there: SIGTERM kept the ticket (exit 143), the re-run re-attached to it
+    assert early.returncode == 143
+    assert "kept" in early.stderr.read()
+    assert "re-attached" in again.stderr.read()
+    assert [e["ticket"] for e in api.events("jetson", {"ticket_dormant"})] == [t_early]
+    assert [e["ticket"] for e in api.events("jetson", {"ticket_reattached"})] == [t_early]
+    assert [e["owner"] for e in api.events("jetson", {"enqueue"})] == ["holder", "early", "late"]
+
+
+def test_sigterm_keeps_the_ticket_ctrl_c_cancels_it(server):
+    api = server.api
+    run_client(server, "acquire", "jetson", "a")
+    # Ctrl-C: give up the place (explicit cancel), exit 130
+    p = popen_client(server, "acquire", "jetson", "b", env=FAST)
+    wait_for(lambda: api.status("jetson")["queue"])
+    time.sleep(0.3)
+    p.send_signal(signal.SIGINT)
+    assert p.wait(10) == 130
+    st = api.status("jetson")
+    assert st["queue"] == [] and st["dormant"] == []
+    assert [e["owner"] for e in api.events("jetson", {"cancel"})] == ["b"]
+    # SIGTERM: keep the place for the re-attach window, exit 143
+    p = popen_client(server, "acquire", "jetson", "c", env=FAST)
+    wait_for(lambda: api.status("jetson")["queue"])
+    t = api.status("jetson")["queue"][0]["ticket"]
+    time.sleep(0.3)
+    p.send_signal(signal.SIGTERM)
+    assert p.wait(10) == 143
+    st = api.status("jetson")
+    assert st["queue"] == [] and [(d["owner"], d["ticket"]) for d in st["dormant"]] == [("c", t)]
+    assert 100 < st["dormant"][0]["dormant_left_s"] <= 120
+    assert "ticket %s kept" % t in p.stderr.read()
+    assert [e["owner"] for e in api.events("jetson", {"cancel"})] == ["b"]
+    out = run_client(server, "status", "jetson").stdout
+    assert "c  DORMANT" in out
+    assert holder(api) == "a"
+
+
+def test_dormant_ticket_never_blocks_a_free_lock(server):
+    """A dormant ticket keeps its place but is skipped: the next connected waiter is served at once,
+    and with nobody else waiting a newcomer gets the free lock at once."""
+    api = server.api
+    run_client(server, "acquire", "jetson", "a")
+    gone = popen_client(server, "acquire", "jetson", "gone", env=FAST)
+    wait_for(lambda: api.status("jetson")["queue"])
+    time.sleep(0.3)
+    gone.send_signal(signal.SIGTERM)
+    gone.wait(10)
+    live = popen_client(server, "acquire", "jetson", "live", env=FAST)
+    wait_for(lambda: queue_owners(api) == ["live"])
+    assert [d["owner"] for d in api.status("jetson")["dormant"]] == ["gone"]
+    t0 = time.monotonic()
+    run_client(server, "release", "jetson", "a")
+    assert live.wait(10) == 0 and holder(api) == "live"
+    assert time.monotonic() - t0 < 3
+    run_client(server, "release", "jetson", "live")
+    t0 = time.monotonic()
+    r = run_client(server, "acquire", "jetson", "newcomer", timeout=10)
+    assert r.returncode == 0 and holder(api) == "newcomer" and time.monotonic() - t0 < 3
+    assert [d["owner"] for d in api.status("jetson")["dormant"]] == ["gone"]  # still there, harmless
+
+
+def test_new_ticket_flag_starts_at_the_back(server):
+    api = server.api
+    run_client(server, "acquire", "jetson", "a")
+    p = popen_client(server, "acquire", "jetson", "early", env=FAST)
+    wait_for(lambda: api.status("jetson")["queue"])
+    t_old = api.status("jetson")["queue"][0]["ticket"]
+    time.sleep(0.3)
+    p.send_signal(signal.SIGTERM)
+    p.wait(10)
+    late = popen_client(server, "acquire", "jetson", "late", env=FAST)
+    wait_for(lambda: queue_owners(api) == ["late"])
+    again = popen_client(server, "acquire", "jetson", "early", "--new-ticket", env=FAST)
+    wait_for(lambda: len(api.status("jetson")["queue"]) == 2)
+    st = api.status("jetson")
+    assert queue_owners(api) == ["late", "early"] and st["dormant"] == []
+    assert st["queue"][1]["ticket"] > t_old
+    run_client(server, "release", "jetson", "a")
+    assert late.wait(10) == 0
+    run_client(server, "release", "jetson", "late")
+    assert again.wait(10) == 0 and holder(api) == "early"
