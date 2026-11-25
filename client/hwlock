@@ -4,12 +4,13 @@
 One holder per resource, a FIFO queue, leases. Talks to an hwlock server (HWLOCK_URL).
 Single file, Python >= 3.8 standard library only: copy it anywhere.
 
-  hwlock acquire <resource> <owner> [reason] [--lease S] [--max-wait S]
+  hwlock acquire <resource> <owner> [reason] [--lease S] [--max-wait S] [--max-hold S]
   hwlock renew   <resource> <owner> [--lease S]
   hwlock release <resource> <owner>
   hwlock status  [resource] [--json]
-  hwlock run     <resource> <owner> [reason] [--lease S] [--max-wait S] -- <cmd...>
-  hwlock hold    <resource> <owner> [reason] --until-file F [--lease S] [--max-wait S]
+  hwlock run     <resource> <owner> [reason] [--lease S] [--max-wait S] [--max-hold S]
+                 [--kill-on-preempt] -- <cmd...>
+  hwlock hold    <resource> <owner> [reason] --until-file F [--lease S] [--max-wait S] [--max-hold S]
   hwlock events  [resource] [--limit N] [--json]
   hwlock force-release <resource> <by> [reason]          (admin; logged)
 
@@ -20,13 +21,23 @@ prints the queue position to stderr while waiting, and exits once you hold the l
 `hold` acquires and keeps renewing until file F exists (or Ctrl-C), then releases.
 Re-acquiring a resource you (same owner) already hold succeeds at once and refreshes the lease.
 
+Starvation guard (server HWLOCK_MAX_HOLD_S, default 2 h): while others wait, nobody may keep a
+resource longer than that from when they took it. Past it, renew/re-acquire is refused
+(OVER_MAX_HOLD, exit 5) and after the server's grace period (default 300 s) the next waiter gets
+it. Nobody waiting = no limit. --max-hold S asks for a shorter limit for this hold.
+`run` and `hold` stop renewing when refused and say so. `run` lets the command go on by default
+(it may still be running when the next holder starts: you are warned); with --kill-on-preempt it
+sends SIGTERM (SIGKILL 10 s later) so the command is gone before the eviction, and exits 5.
+`hold` exits 5 once the lock is gone.
+
 Env: HWLOCK_URL (default http://127.0.0.1:8770), HWLOCK_TOKEN (bearer token, optional). Without them,
 `url=` and `token=` lines in ~/.config/hwlock/config (or $HWLOCK_CONFIG) are used.
 
-Exit codes: 0 ok | 1 not the holder / not held (renew, release, force-release), or renew/re-acquire
-refused: held longer than the server's max hold while others wait (OVER_MAX_HOLD) | 2 usage error |
+Exit codes: 0 ok | 1 not the holder / not held (renew, release, force-release) | 2 usage error |
 3 gave up after --max-wait | 4 server unreachable or rejected the request (auth, bad input) |
-130 interrupted while waiting | run: the command's exit code (128+N if killed by signal N).
+5 OVER_MAX_HOLD: renew/re-acquire refused, held past the max hold while others wait; `hold` lost the
+lock that way; `run --kill-on-preempt` stopped the command | 130 interrupted while waiting |
+run: the command's exit code (128+N if killed by signal N).
 """
 
 import json
@@ -62,7 +73,8 @@ _CONF = _config()
 URL = (os.environ.get("HWLOCK_URL") or _CONF.get("url") or "http://127.0.0.1:8770").rstrip("/")
 TOKEN = os.environ.get("HWLOCK_TOKEN") or _CONF.get("token") or ""
 LONG_POLL_S = float(os.environ.get("HWLOCK_LONG_POLL_S", "25"))
-EXIT_OK, EXIT_NOT_HOLDER, EXIT_USAGE, EXIT_TIMEOUT, EXIT_SERVER, EXIT_INT = 0, 1, 2, 3, 4, 130
+EXIT_OK, EXIT_NOT_HOLDER, EXIT_USAGE, EXIT_TIMEOUT, EXIT_SERVER, EXIT_PREEMPTED, EXIT_INT = 0, 1, 2, 3, 4, 5, 130
+KILL_AFTER_S = 10.0  # run --kill-on-preempt: SIGTERM, then SIGKILL this much later
 
 
 class ServerError(Exception):
@@ -132,7 +144,8 @@ def server_error_exit(err):
     if err.status == 401:
         die("unauthorized: set HWLOCK_TOKEN to the server's token", EXIT_SERVER)
     if err.status == 409 and p.get("error") == "over_max_hold":
-        die("%s (evicted in %s)" % (p.get("message"), fmt_s(p.get("evict_in_s"))), EXIT_NOT_HOLDER)
+        die("OVER_MAX_HOLD: %s (evicted in %s)" % (p.get("message"), fmt_s(p.get("evict_in_s"))),
+            EXIT_PREEMPTED)
     if err.status == 409:
         die("%s (holder: %s)" % (p.get("message", "not the holder"), holder_text(p.get("holder"))),
             EXIT_NOT_HOLDER)
@@ -142,9 +155,9 @@ def server_error_exit(err):
 class Acquirer(object):
     """Takes a ticket and long-polls until granted. Survives server restarts (re-attaches by ticket)."""
 
-    def __init__(self, resource, owner, reason=None, lease=None, max_wait=None, pid=None):
+    def __init__(self, resource, owner, reason=None, lease=None, max_wait=None, pid=None, max_hold=None):
         self.resource, self.owner, self.reason = resource, owner, reason
-        self.lease, self.max_wait = lease, max_wait
+        self.lease, self.max_wait, self.max_hold = lease, max_wait, max_hold
         self.pid = pid if pid is not None else os.getppid()
         self.ticket = None
         self.granted = False
@@ -154,6 +167,8 @@ class Acquirer(object):
              "pid": self.pid, "wait": wait}
         if self.lease is not None:
             b["lease"] = self.lease
+        if self.max_hold is not None:
+            b["max_hold"] = self.max_hold
         if self.ticket is not None:
             b["ticket"] = self.ticket
         return b
@@ -213,8 +228,8 @@ class Acquirer(object):
             pass
 
 
-def acquire_or_exit(resource, owner, reason, lease, max_wait, pid=None):
-    acq = Acquirer(resource, owner, reason, lease, max_wait, pid)
+def acquire_or_exit(resource, owner, reason, lease, max_wait, pid=None, max_hold=None):
+    acq = Acquirer(resource, owner, reason, lease, max_wait, pid, max_hold)
 
     def interrupted(_signum, _frame):
         raise KeyboardInterrupt
@@ -243,30 +258,85 @@ def release(resource, owner, quiet=False):
 
 
 class Renewer(threading.Thread):
-    """Renews the lease every lease/3 seconds until stopped."""
+    """Keeps the lease alive (renew every lease/3) until stopped, and watches the starvation guard.
 
-    def __init__(self, resource, owner, lease_s):
+    While the server reports a max hold, it looks at the status at least every grace/3 (a cheap GET, not a
+    renew) and renews right after the refusal point once others wait, so a refusal is noticed well before
+    the eviction. After a refusal
+    (OVER_MAX_HOLD) it stops renewing for good and only checks every few seconds whether the lock is
+    still ours. Callbacks: on_refused(payload) once, on_lost(message) once.
+    """
+
+    def __init__(self, resource, owner, lease_s, guard=None, on_refused=None, on_lost=None):
         threading.Thread.__init__(self, name="hwlock-renew", daemon=True)
         self.resource, self.owner = resource, owner
         self.lease_s = float(lease_s)
         self.stop_ev = threading.Event()
         self.lost = False
-        self.over = False
+        self.over = None  # the server's over_max_hold payload once a renew was refused
+        self.guard = guard  # the holder's "guard" from the last answer (acquire, renew or status)
+        self.next_renew = time.monotonic() + max(0.2, self.lease_s / 3.0)
+        self.on_refused, self.on_lost = on_refused, on_lost
+
+    def _refusal_due(self):
+        g = self.guard or {}
+        return "refuse_in_s" in g and g["refuse_in_s"] <= 0
+
+    def _next_wait(self):
+        wait = max(0.2, self.next_renew - time.monotonic())
+        g = self.guard
+        if self.over is not None:
+            return min(wait, 2.0)  # not renewing any more: just watch for the loss
+        if g:
+            wait = min(wait, max(0.2, g.get("grace_s", wait) / 3.0))
+            if "refuse_in_s" in g and g["refuse_in_s"] > 0:
+                wait = min(wait, g["refuse_in_s"] + 0.2)
+        return wait
+
+    def _lose(self, msg):
+        if not self.lost:
+            self.lost = True
+            say("WARNING: lost %s (%s)" % (self.resource, msg))
+            if self.on_lost:
+                self.on_lost(msg)
+
+    def _watch(self):
+        """Is the lock still ours? Also refreshes the guard (waiters, deadlines) without renewing."""
+        try:
+            _, st = call("GET", "/status/%s" % self.resource)
+        except (ServerError, Unreachable):
+            return
+        h = st.get("holder") or {}
+        if h.get("owner") != self.owner:
+            if self.over is not None:
+                self._lose("evicted for the next in line after the max hold" if h else "lease ran out")
+            else:
+                self._lose("now held by %s" % h["owner"] if h else "lease ran out")
+        else:
+            self.guard = h.get("guard")
 
     def run(self):
-        interval = max(0.2, self.lease_s / 3.0)
-        while not self.stop_ev.wait(interval):
+        while not self.lost and not self.stop_ev.wait(self._next_wait()):
+            if self.over is not None or (time.monotonic() < self.next_renew and not self._refusal_due()):
+                self._watch()
+                if self.over is not None or not self._refusal_due():
+                    continue
             try:
-                call("POST", "/r/%s/renew" % self.resource, {"owner": self.owner, "lease": self.lease_s})
+                _, out = call("POST", "/r/%s/renew" % self.resource, {"owner": self.owner, "lease": self.lease_s})
+                self.guard = (out.get("holder") or {}).get("guard")
+                self.next_renew = time.monotonic() + max(0.2, self.lease_s / 3.0)
             except ServerError as err:
                 p = err.payload or {}
                 if err.status == 409 and p.get("error") == "over_max_hold":
-                    if not self.over:
-                        self.over = True
-                        say("WARNING: %s; evicted in %s" % (p.get("message"), fmt_s(p.get("evict_in_s"))))
-                elif err.status == 409 and not self.lost:
-                    self.lost = True
-                    say("WARNING: lost %s (%s)" % (self.resource, (err.payload or {}).get("message")))
+                    self.over = p
+                    say("WARNING: OVER_MAX_HOLD: %s. Not renewing any more; the next in line gets %s in %s,"
+                        " or sooner when the lease runs out (%s left). Finish up and release."
+                        % (p.get("message"), self.resource, fmt_s(p.get("evict_in_s")),
+                           fmt_s(p.get("lease_left_s"))))
+                    if self.on_refused:
+                        self.on_refused(p)
+                elif err.status == 409:
+                    self._lose(p.get("message"))
             except Unreachable as err:
                 say("renew failed (%s); will retry" % err)
 
@@ -310,14 +380,26 @@ def parse(args, positional_min, positional_max, flags, allow_dashdash=False):
 
 def acquired_msg(out, owner):
     h = out.get("holder") or {}
-    return "%s holds %s (lease %s; renew or release)%s" % (
-        owner, out.get("resource"), fmt_s(h.get("lease_s")), " [already held: lease refreshed]"
-        if out.get("reacquired") else "")
+    g = h.get("guard")
+    return "%s holds %s (lease %s; renew or release%s)%s" % (
+        owner, out.get("resource"), fmt_s(h.get("lease_s")),
+        "; max hold %s while others wait" % fmt_s(g["max_hold_s"]) if g else "",
+        " [already held: lease refreshed]" if out.get("reacquired") else "")
+
+
+def guard_text(g):
+    """Starvation-guard deadlines for `status` (only while others wait)."""
+    if not g or "evict_in_s" not in g:
+        return ""
+    return "  max hold %s: %s, evicted in %s" % (
+        fmt_s(g["max_hold_s"]), "RENEW REFUSED" if g["refuse_in_s"] <= 0 else
+        "renew refused in %s" % fmt_s(g["refuse_in_s"]), fmt_s(max(0, g["evict_in_s"])))
 
 
 def cmd_acquire(args):
-    (res, owner, *rest), o, _ = parse(args, 2, 3, {"lease": float, "max-wait": float})
-    out = acquire_or_exit(res, owner, rest[0] if rest else None, o.get("lease"), o.get("max-wait"))
+    (res, owner, *rest), o, _ = parse(args, 2, 3, {"lease": float, "max-wait": float, "max-hold": float})
+    out = acquire_or_exit(res, owner, rest[0] if rest else None, o.get("lease"), o.get("max-wait"),
+                          max_hold=o.get("max-hold"))
     print("hwlock: " + acquired_msg(out, owner))
     return EXIT_OK
 
@@ -331,7 +413,8 @@ def cmd_renew(args):
         _, out = call("POST", "/r/%s/renew" % res, body)
     except ServerError as err:
         if (err.payload or {}).get("error") == "over_max_hold":
-            print("OVER_MAX_HOLD waiting=%s" % err.payload.get("waiting"))
+            print("OVER_MAX_HOLD waiting=%s evict_in=%s" % (err.payload.get("waiting"),
+                                                           int(err.payload.get("evict_in_s") or 0)))
             server_error_exit(err)
         print("NOT_HOLDER holder=%s" % ((err.payload or {}).get("holder") or {}).get("owner", ""))
         server_error_exit(err)
@@ -368,10 +451,10 @@ def cmd_status(args):
     for r in out.get("resources", [out]):
         h = r["holder"]
         if h:
-            print("%s: held by %s  since %s  held %s  lease left %s  host %s pid %s  reason: %s" % (
+            print("%s: held by %s  since %s  held %s  lease left %s  host %s pid %s  reason: %s%s" % (
                 r["resource"], h["owner"], time.strftime("%H:%M:%S", time.localtime(h["since"])),
                 fmt_s(h["held_s"]), fmt_s(h["lease_left_s"]), h.get("host") or "-", h.get("pid") or "-",
-                h.get("reason") or ""))
+                h.get("reason") or "", guard_text(h.get("guard"))))
         else:
             print("%s: free" % r["resource"])
         for q in r["queue"]:
@@ -416,19 +499,51 @@ def _lease_of(out, requested):
 
 
 def cmd_run(args):
-    pos, o, cmd = parse(args, 2, 3, {"lease": float, "max-wait": float}, allow_dashdash=True)
+    pos, o, cmd = parse(args, 2, 3, {"lease": float, "max-wait": float, "max-hold": float,
+                                     "kill-on-preempt": bool}, allow_dashdash=True)
     if not cmd:
         die("usage: hwlock run <resource> <owner> [reason] -- <cmd...>")
     res, owner = pos[0], pos[1]
+    kill = o.get("kill-on-preempt", False)
     import subprocess
 
     out = acquire_or_exit(res, owner, pos[2] if len(pos) > 2 else None, o.get("lease"), o.get("max-wait"),
-                          pid=os.getpid())
+                          pid=os.getpid(), max_hold=o.get("max-hold"))
     say(acquired_msg(out, owner))
-    renewer = Renewer(res, owner, _lease_of(out, o.get("lease")))
-    renewer.start()
     child = None
     old = {}
+    preempted = []
+
+    def stop_child(why, deadline_s):
+        """--kill-on-preempt: SIGTERM now, SIGKILL before the lock goes to the next holder."""
+        if preempted:
+            return
+        preempted.append(why)
+        if child is None or child.poll() is not None:
+            return
+        after = max(0.0, min(KILL_AFTER_S, deadline_s - 1.0))
+        say("--kill-on-preempt: stopping the command (SIGTERM now, SIGKILL in %s if it is still running)"
+            % fmt_s(after))
+        send(signal.SIGTERM)
+        t = threading.Timer(after, send, (signal.SIGKILL,))
+        t.daemon = True
+        t.start()
+
+    def on_refused(p):
+        if kill:
+            stop_child("over_max_hold", min(p.get("evict_in_s") or 0, p.get("lease_left_s") or 0))
+        else:
+            preempted.append("over_max_hold")
+            say("the command keeps running (no --kill-on-preempt); it must not use %s after that" % res)
+
+    def on_lost(msg):
+        if kill:
+            stop_child("lost", 0)
+        elif "lost" not in preempted:
+            preempted.append("lost")
+
+    renewer = Renewer(res, owner, _lease_of(out, o.get("lease")), (out.get("holder") or {}).get("guard"),
+                      on_refused, on_lost)
 
     def send(signum):
         if child is not None and child.poll() is None:
@@ -455,12 +570,20 @@ def cmd_run(args):
         except OSError as err:
             say("cannot start %r: %s" % (cmd[0], err))
             return 127
+        renewer.start()  # only now: a refusal must find the child to stop
         while True:
             try:
                 rc = child.wait()
                 break
             except KeyboardInterrupt:  # pragma: no cover - handler replaced, kept for safety
                 send(signal.SIGINT)
+        if kill and preempted:
+            say("command stopped: %s was taken away (max hold exceeded while others wait); exit %d"
+                % (res, EXIT_PREEMPTED))
+            return EXIT_PREEMPTED
+        if preempted:
+            say("WARNING: the command ran past the max hold of %s while others waited%s; check its results"
+                % (res, " and after the lock was gone" if "lost" in preempted or renewer.lost else ""))
         return rc if rc >= 0 else 128 - rc
     finally:
         renewer.stop()
@@ -470,16 +593,18 @@ def cmd_run(args):
 
 
 def cmd_hold(args):
-    pos, o, _ = parse(args, 2, 3, {"lease": float, "max-wait": float, "until-file": str, "poll": float})
+    pos, o, _ = parse(args, 2, 3, {"lease": float, "max-wait": float, "max-hold": float, "until-file": str,
+                                   "poll": float})
     if "until-file" not in o:
         die("usage: hwlock hold <resource> <owner> [reason] --until-file F")
     res, owner, until = pos[0], pos[1], o["until-file"]
     out = acquire_or_exit(res, owner, pos[2] if len(pos) > 2 else None, o.get("lease"), o.get("max-wait"),
-                          pid=os.getpid())
+                          pid=os.getpid(), max_hold=o.get("max-hold"))
     say(acquired_msg(out, owner) + "; holding until %s exists" % until)
-    renewer = Renewer(res, owner, _lease_of(out, o.get("lease")))
-    renewer.start()
     stop = threading.Event()
+    renewer = Renewer(res, owner, _lease_of(out, o.get("lease")), (out.get("holder") or {}).get("guard"),
+                      on_lost=lambda _msg: stop.set())
+    renewer.start()
     for s in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(s, lambda *_: stop.set())
     try:
@@ -489,7 +614,13 @@ def cmd_hold(args):
         pass
     finally:
         renewer.stop()
-        release(res, owner)
+        if not renewer.lost:
+            release(res, owner)
+    if renewer.lost:
+        say("hold of %s ended: the lock is gone (%s); exit %d" % (
+            res, "max hold exceeded while others waited" if renewer.over else "lease lost",
+            EXIT_PREEMPTED if renewer.over else EXIT_NOT_HOLDER))
+        return EXIT_PREEMPTED if renewer.over else EXIT_NOT_HOLDER
     say("released %s" % res)
     return EXIT_OK
 

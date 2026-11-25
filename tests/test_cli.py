@@ -1,5 +1,6 @@
 """The single-file `hwlock` client, run as a subprocess against a real server."""
 
+import os
 import signal
 import sys
 import time
@@ -264,7 +265,122 @@ def test_renew_over_max_hold_prints_like_jetson_lock(make_server):
     wait_for(lambda: server.api.status("jetson")["queue"])
     time.sleep(1.2)
     r = run_client(server, "renew", "jetson", "hog")
-    assert r.returncode == 1 and r.stdout.startswith("OVER_MAX_HOLD waiting=1"), (r.stdout, r.stderr)
+    assert r.returncode == 5 and r.stdout.startswith("OVER_MAX_HOLD waiting=1"), (r.stdout, r.stderr)
     waiter.wait(10)  # evicted after max hold + grace
     assert waiter.returncode == 0 and holder(server.api) == "next"
     assert server.api.events("jetson", {"evict_max_hold"})[0]["owner"] == "hog"
+
+
+GUARD = {"HWLOCK_MAX_HOLD_S": "0", "HWLOCK_RESOURCE_MAX_HOLD_S": "jetson=2", "HWLOCK_RESOURCE_HOLD_GRACE_S": "jetson=3"}
+
+
+def acquired_at(api, owner, res="jetson"):
+    return [e["ts"] for e in api.events(res, {"acquire"}) if e["owner"] == owner]
+
+
+def test_blind_proxy_hold_loses_to_a_waiter_within_max_hold_plus_grace(make_server, tmp_path):
+    """The 2026-11-25 incident: an idle proxy hold renewing blindly while a job queues behind it."""
+    server = make_server(**GUARD)
+    api = server.api
+    hog = popen_client(server, "hold", "jetson", "proxy", "idle proxy", "--lease", "60",
+                       "--until-file", str(tmp_path / "never"))
+    wait_for(lambda: holder(api) == "proxy")
+    waiter = popen_client(server, "acquire", "jetson", "job", "real work", env=FAST)
+    waiter.wait(15)
+    assert waiter.returncode == 0 and holder(api) == "job"
+    t_hog, t_job = acquired_at(api, "proxy")[0], acquired_at(api, "job")[0]
+    assert 2 + 3 <= t_job - t_hog < 2 + 3 + 1.5  # max hold + grace (the server sweeps every 0.2 s)
+    _, err = hog.communicate(timeout=10)
+    assert hog.returncode == 5, err  # hold ends on its own, with its own exit code
+    assert "OVER_MAX_HOLD" in err and "Not renewing any more" in err and "exit 5" in err
+    kinds = [e["kind"] for e in api.events("jetson")]
+    assert kinds.count("renew_refused") == 1  # it stopped renewing after the refusal
+    assert kinds.count("evict_max_hold") == 1 and "release" not in kinds
+
+
+def test_hold_without_waiters_has_no_limit(make_server, tmp_path):
+    server = make_server(**GUARD)
+    done = tmp_path / "done"
+    hog = popen_client(server, "hold", "jetson", "solo", "--lease", "3", "--until-file", str(done))
+    wait_for(lambda: holder(server.api) == "solo")
+    time.sleep(7)  # > max hold + grace, and the 3 s lease is renewed meanwhile
+    assert holder(server.api) == "solo"
+    done.touch()
+    _, err = hog.communicate(timeout=10)
+    assert hog.returncode == 0, err
+    kinds = [e["kind"] for e in server.api.events("jetson")]
+    assert "renew_refused" not in kinds and "evict_max_hold" not in kinds and "renew" in kinds
+
+
+def test_run_past_max_hold_warns_and_lets_the_command_finish_by_default(make_server):
+    server = make_server(**GUARD)
+    api = server.api
+    run = popen_client(server, "run", "jetson", "long", "--lease", "60", "--",
+                       sys.executable, "-c", "import time; time.sleep(9); print('done')")
+    wait_for(lambda: holder(api) == "long")
+    waiter = popen_client(server, "acquire", "jetson", "next", env=FAST)
+    waiter.wait(15)
+    assert waiter.returncode == 0 and run.poll() is None  # the command is still running
+    out, err = run.communicate(timeout=15)
+    assert run.returncode == 0 and "done" in out, err  # the command's own exit code
+    assert "OVER_MAX_HOLD" in err and "keeps running" in err and "lost jetson" in err
+    assert "check its results" in err
+    assert holder(api) == "next"  # run did not release the next holder's lock
+
+
+def test_run_kill_on_preempt_stops_the_command_before_the_eviction(make_server, tmp_path):
+    server = make_server(**GUARD)
+    api = server.api
+    pidfile = tmp_path / "pid"
+    # ignores SIGTERM, so only the SIGKILL escalation can stop it in time
+    child = ("import os, signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+             "open(%r, 'w').write(str(os.getpid())); time.sleep(60)" % str(pidfile))
+    run = popen_client(server, "run", "jetson", "long", "--lease", "60", "--kill-on-preempt", "--",
+                       sys.executable, "-c", child)
+    wait_for(pidfile.exists)
+    pid = int(wait_for(pidfile.read_text))
+    waiter = popen_client(server, "acquire", "jetson", "next", env=FAST)
+    died = {}
+
+    def alive():
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+
+    t0 = time.time()
+    while time.time() - t0 < 15 and alive():
+        time.sleep(0.02)
+    died["t"] = time.time()
+    _, err = run.communicate(timeout=10)
+    waiter.wait(15)
+    assert run.returncode == 5, err
+    assert "--kill-on-preempt" in err and "command stopped" in err
+    assert waiter.returncode == 0 and holder(api) == "next"
+    # dead before the eviction deadline (since + max hold + grace) ...
+    assert died["t"] < acquired_at(api, "long")[0] + 2 + 3 - 0.3, (died["t"] - acquired_at(api, "long")[0], err)
+    # ... and the lock went on by run's own release (after it reaped the command), not by eviction
+    kinds = [(e["kind"], e["owner"]) for e in api.events("jetson") if e["kind"] in ("release", "evict_max_hold",
+                                                                                   "acquire")]
+    assert kinds == [("acquire", "long"), ("release", "long"), ("acquire", "next")], kinds
+
+
+def test_status_shows_held_for_and_the_guard_deadline(make_server):
+    server = make_server(HWLOCK_MAX_HOLD_S="0", HWLOCK_RESOURCE_MAX_HOLD_S="jetson=600")
+    run_client(server, "acquire", "jetson", "a", "deploy")
+    r = run_client(server, "status", "jetson")
+    assert "held 0s" in r.stdout and "max hold" not in r.stdout  # nobody waits: no deadline
+    p = popen_client(server, "acquire", "jetson", "b", env=FAST)
+    wait_for(lambda: server.api.status("jetson")["queue"])
+    r = run_client(server, "status", "jetson")
+    assert "max hold 10m00s: renew refused in 9m5" in r.stdout and "evicted in 14m5" in r.stdout, r.stdout
+    run_client(server, "release", "jetson", "a")
+    p.wait(10)
+
+
+def test_acquire_max_hold_flag(make_server):
+    server = make_server(HWLOCK_MAX_HOLD_S="600")
+    r = run_client(server, "acquire", "jetson", "a", "--max-hold", "30")
+    assert r.returncode == 0 and "max hold 30s while others wait" in r.stdout, r.stdout
+    assert server.api.status("jetson")["holder"]["guard"]["max_hold_s"] == 30

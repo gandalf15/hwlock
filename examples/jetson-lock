@@ -12,8 +12,12 @@
 # Env (same as before): JETSON_HOST (marcel@192.168.0.99), JETSON_LOCK_LEASE_S (default: server's 1800),
 # JETSON_LOCK_MAX_WAIT_S (0 = forever). New: HWLOCK_URL, HWLOCK_TOKEN, HWLOCK (path of the client),
 # JETSON_LOCK_RESOURCE (default jetson), JETSON_SSH (the ssh command used by `run`).
+# Starvation guard: the limits live on the server (HWLOCK_MAX_HOLD_S / HWLOCK_HOLD_GRACE_S, or per resource
+# HWLOCK_RESOURCE_MAX_HOLD_S=jetson=7200). JETSON_LOCK_MAX_HOLD_S, if set, asks for a shorter limit for this
+# hold (--max-hold; the server caps it); JETSON_LOCK_GRACE_S is server-side only and ignored here.
+# JETSON_LOCK_KILL_ON_PREEMPT=1: `run` stops the ssh command when the max hold is hit (else it warns).
 # Exit codes: as `hwlock` (0 ok, 1 not holder, 2 usage, 3 gave up after max-wait, 4 server problem,
-# 130 interrupted; run: the remote command's code).
+# 5 OVER_MAX_HOLD, 130 interrupted; run: the remote command's code).
 set -euo pipefail
 HOST=${JETSON_HOST:-marcel@192.168.0.99}
 RES=${JETSON_LOCK_RESOURCE:-jetson}
@@ -21,15 +25,17 @@ SSH=${JETSON_SSH:-ssh -o BatchMode=yes -o ConnectTimeout=10}
 HWLOCK=${HWLOCK:-$(command -v hwlock || echo "$HOME/code/hwlock/client/hwlock")}
 [[ -x $HWLOCK ]] || { echo "jetson-lock: hwlock client not found (set HWLOCK=/path/to/hwlock)" >&2; exit 2; }
 
-lease=(); wait=()
+lease=(); wait=(); hold=(); kill=()
 [[ -n ${JETSON_LOCK_LEASE_S:-} ]] && lease=(--lease "$JETSON_LOCK_LEASE_S")
 [[ ${JETSON_LOCK_MAX_WAIT_S:-0} != 0 ]] && wait=(--max-wait "$JETSON_LOCK_MAX_WAIT_S")
+[[ ${JETSON_LOCK_MAX_HOLD_S:-0} != 0 ]] && hold=(--max-hold "$JETSON_LOCK_MAX_HOLD_S")
+[[ ${JETSON_LOCK_KILL_ON_PREEMPT:-0} != 0 ]] && kill=(--kill-on-preempt)
 
 cmd=${1:-}; shift || true
 case $cmd in
 acquire)
     [[ $# -ge 1 && $# -le 2 ]] || { echo "usage: jetson-lock acquire <owner> [reason]" >&2; exit 2; }
-    exec "$HWLOCK" acquire "$RES" "$@" ${lease[@]+"${lease[@]}"} ${wait[@]+"${wait[@]}"} ;;
+    exec "$HWLOCK" acquire "$RES" "$@" ${lease[@]+"${lease[@]}"} ${wait[@]+"${wait[@]}"} ${hold[@]+"${hold[@]}"} ;;
 renew)   exec "$HWLOCK" renew "$RES" "${1:?usage: jetson-lock renew <owner>}" ${lease[@]+"${lease[@]}"} ;;
 release) exec "$HWLOCK" release "$RES" "${1:?usage: jetson-lock release <owner>}" ;;
 status)  exec "$HWLOCK" status "$RES" ;;
@@ -40,6 +46,6 @@ run)
     shift
     # shellcheck disable=SC2086  # $SSH is a command line on purpose
     exec "$HWLOCK" run "$RES" "$owner" ${reason[@]+"${reason[@]}"} ${lease[@]+"${lease[@]}"} \
-        ${wait[@]+"${wait[@]}"} -- $SSH "$HOST" "$@" ;;
-*) sed -n '2,19p' "$0"; exit 2 ;;
+        ${wait[@]+"${wait[@]}"} ${hold[@]+"${hold[@]}"} ${kill[@]+"${kill[@]}"} -- $SSH "$HOST" "$@" ;;
+*) sed -n '2,24p' "$0"; exit 2 ;;
 esac

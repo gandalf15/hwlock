@@ -7,7 +7,9 @@
 #   hwlock.sh release <resource> <owner>
 #   hwlock.sh status  [resource]                              # raw JSON
 #
-# Env: HWLOCK_URL (default http://127.0.0.1:8770), HWLOCK_TOKEN. Exit: 0 ok, 1 not holder, 4 server error.
+# Env: HWLOCK_URL (default http://127.0.0.1:8770), HWLOCK_TOKEN.
+# Exit: 0 ok, 1 not holder, 4 server error, 5 OVER_MAX_HOLD (renew refused: held past the server's max
+# hold while others wait; release soon, you are evicted after the grace period).
 set -euo pipefail
 URL=${HWLOCK_URL:-http://127.0.0.1:8770}
 auth=(); [[ -n ${HWLOCK_TOKEN:-} ]] && auth=(-H "Authorization: Bearer $HWLOCK_TOKEN")
@@ -42,8 +44,11 @@ renew|release)
     [[ $cmd == renew && -n ${3:-} ]] && body+=", \"lease\": $3"
     r=$(post "/r/$res/$cmd" "{$body}"); code=${r%% *}
     case $code in 200) echo "${cmd^^}ED" | sed 's/EED$/ED/'; exit 0 ;;
-                  409) echo "NOT_HOLDER holder=$(field owner "${r#* }")"; exit 1 ;;
+                  409) if [[ $(field error "${r#* }") == over_max_hold ]]; then
+                           echo "OVER_MAX_HOLD waiting=$(field waiting "${r#* }") evict_in=$(field evict_in_s "${r#* }" | cut -d. -f1)"; exit 5
+                       fi
+                       echo "NOT_HOLDER holder=$(field owner "${r#* }")"; exit 1 ;;
                   *) echo "hwlock: server said ${r}" >&2; exit 4 ;; esac ;;
 status) curl -sS -m 15 "${auth[@]}" "$URL/status${1:+/$1}"; echo ;;
-*) sed -n '2,10p' "$0"; exit 2 ;;
+*) sed -n '2,12p' "$0"; exit 2 ;;
 esac
