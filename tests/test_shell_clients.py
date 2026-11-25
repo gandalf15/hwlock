@@ -95,6 +95,8 @@ def test_over_max_hold_exit_5_in_bash_client_and_wrapper(make_server):
     assert r.returncode == 5 and r.stdout.startswith("OVER_MAX_HOLD waiting=1"), (r.stdout, r.stderr)
     r = sh(server, "renew", "jetson", "job-a")
     assert r.returncode == 5 and r.stdout.startswith("OVER_MAX_HOLD waiting=1 evict_in="), (r.stdout, r.stderr)
+    r = sh(server, "acquire", "jetson", "job-a")  # a re-acquire is refused the same way
+    assert r.returncode == 5 and r.stdout.startswith("OVER_MAX_HOLD waiting=1"), (r.stdout, r.stderr)
     r = sh(server, "renew", "jetson", "nobody")
     assert r.returncode == 1 and r.stdout.strip() == "NOT_HOLDER holder=job-a"
     api.post("/r/jetson/cancel", {"ticket": ticket})

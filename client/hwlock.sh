@@ -36,6 +36,7 @@ acquire)
                  trap 'post "/r/$res/cancel" "{\"ticket\": $ticket}" >/dev/null; exit 130' INT TERM
                  r=$(post "/r/$res/acquire" "{$body, \"ticket\": $ticket, \"wait\": 25}" 40) ;;
             410) r=$(post "/r/$res/acquire" "{$body, \"wait\": 0}") ;;   # ticket dropped: rejoin
+            409) echo "OVER_MAX_HOLD waiting=$(field waiting "$json") evict_in=$(field evict_in_s "$json" | cut -d. -f1)"; exit 5 ;;
             *)   echo "hwlock: server said $code $json" >&2; exit 4 ;;
         esac
     done ;;
