@@ -42,7 +42,9 @@ measurements, run out of memory or break deploys. The `hwlock` service serialise
 9. **Wait in the background, never poll.** An acquire can wait a long time. Start it as a BACKGROUND command
    (your harness's background/`run_in_background` option) and go on with local work: you are notified when it
    exits, and its exit code tells you what happened. Never loop, `sleep`, `tail` or `grep` over its output file to
-   see whether it is done. The same goes for `hwlock watch <resource>`, which blocks until the device's next
+   see whether it is done. For a quick look before starting, `hwlock check <resource>` answers at once
+   (exit 0 up, 8 degraded, 6 down; it uses the server's probes, so a frozen box that still answers ping is down).
+   The same goes for `hwlock watch <resource>`, which blocks until the device's next
    health change: start it in the background if you want to hear when the device dies or comes back.
 10. **The device can die.** The server probes it (ssh banner, exporter) and tells waiters and holders at once.
    Nobody is granted a device that is down; `acquire` keeps waiting and prints the state (`--fail-if-down` to

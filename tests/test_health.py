@@ -461,6 +461,22 @@ def test_watch_codes(jetson):
     assert w.returncode == 6 and json.loads(w.stdout.read())["events"][-1]["kind"] == "health_down"
 
 
+def test_check_is_one_shot_with_codes(jetson):
+    """`hwlock check`: one request, no waiting; exit code = current health (real exporter process)."""
+    srv, exp = jetson()
+    r = run_client(srv, "check", "jetson")
+    assert r.returncode == 0 and r.stdout.startswith("jetson is UP") and "mem free" in r.stdout
+    assert run_client(srv, "check", "nothing-here").returncode == 4
+    exp.reboot()
+    wait_for(lambda: "rebooted" in kinds(srv.api))
+    assert run_client(srv, "check", "jetson", "--rebooted-within", "60").returncode == 7
+    assert run_client(srv, "check", "jetson").returncode == 0          # rebooted but up again: plain check says up
+    exp.kill()
+    wait_for(lambda: health_state(srv.api) == "down")
+    r = run_client(srv, "check", "jetson", "--json")
+    assert r.returncode == 6 and json.loads(r.stdout)["health"]["state"] == "down"
+
+
 # ---------------------------------------------------------------------------- restarts
 def test_health_survives_server_restarts(tmp_path, make_server, make_exporter):
     exp = make_exporter()

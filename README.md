@@ -43,6 +43,7 @@ hwlock run     <resource> <owner> [reason] [--lease S] [--max-wait S] [--max-hol
                [--on-down kill|warn] [--fail-if-down] [--exit-on-degraded] -- <cmd...>
 hwlock hold    <resource> <owner> [reason] --until-file F [--lease S] [--max-wait S] [--max-hold S] [--new-ticket] [--fail-if-down] [--exit-on-degraded]
 hwlock watch   <resource> [--until up|down|degraded|rebooted] [--timeout S] [--json]
+hwlock check   <resource> [--rebooted-within S] [--json]   # one-shot: 0 up, 8 degraded, 6 down/unknown, 7 rebooted
 hwlock events  [resource] [--limit N] [--json]
 hwlock force-release <resource> <by> [reason]      # admin, logged
 ```

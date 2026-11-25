@@ -14,6 +14,7 @@ Single file, Python >= 3.8 standard library only: copy it anywhere.
                  [--new-ticket]
   hwlock events  [resource] [--limit N] [--json]
   hwlock watch   <resource> [--until STATE] [--timeout S] [--json]
+  hwlock check   <resource> [--rebooted-within S] [--json]   (one-shot: 0 up, 8 degraded, 6 down/unknown, 7 rebooted)
   hwlock force-release <resource> <by> [reason]          (admin; logged)
 acquire/run/hold also take: --fail-if-down --exit-on-degraded; run also: --on-down kill|warn
 
@@ -1011,8 +1012,37 @@ def cmd_watch(args):
         return HEALTH_EXIT.get(hit, EXIT_OK)
 
 
+def cmd_check(args):
+    """One-shot health check of <resource>, for scripts and a quick look: one request, no waiting.
+    Exit 0 up, 8 degraded, 6 down or not yet known, 7 if it rebooted within --rebooted-within S (default: off),
+    4 server unreachable or no probes configured. Uses the server's probes (ssh banner, boot id, memory, temps),
+    so a box that answers ping but is frozen counts as down."""
+    pos, o, _ = parse(args, 1, 1, {"rebooted-within": float, "json": bool})
+    res = pos[0]
+    try:
+        _, out = call("GET", "/r/%s/health" % res, timeout=15)
+    except ServerError as err:
+        if err.status == 404:
+            die("no health probes are configured for %s on the server (%s)" % (res, URL), EXIT_SERVER)
+        server_error_exit(err)
+    except Unreachable as err:
+        die("server unreachable (%s)" % err, EXIT_SERVER)
+    hv = out.get("health") or {}
+    state = hv.get("state") or "unknown"
+    rb, win = hv.get("last_reboot"), o.get("rebooted-within")
+    rebooted = bool(win and rb and isinstance(rb, (int, float)) and (out.get("now") or time.time()) - rb <= win)
+    if o.get("json"):
+        print(json.dumps(out))
+    else:
+        m = metrics_text(hv.get("metrics"))
+        print(("REBOOTED " if rebooted else "") + health_text(res, hv) + (("  [" + m + "]") if m else ""))
+    if rebooted:
+        return EXIT_REBOOTED
+    return {"up": EXIT_OK, "degraded": EXIT_DEGRADED}.get(state, EXIT_DOWN)
+
+
 COMMANDS = {"acquire": cmd_acquire, "renew": cmd_renew, "release": cmd_release, "status": cmd_status,
-            "run": cmd_run, "hold": cmd_hold, "events": cmd_events, "watch": cmd_watch,
+            "run": cmd_run, "hold": cmd_hold, "events": cmd_events, "watch": cmd_watch, "check": cmd_check,
             "force-release": cmd_force_release}
 
 
