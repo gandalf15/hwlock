@@ -437,3 +437,58 @@ def test_old_database_gets_the_new_column(tmp_path, clock):
         h = s.status("gpu")["holder"]
         assert h["owner"] == "hog" and h["held_s"] == 10 and h["guard"]["max_hold_s"] == 500
         s.close()
+
+
+def _guarded(tmp_path, clock, name="e.db"):
+    return Store(str(tmp_path / name), default_lease_s=900, max_lease_s=1000, heartbeat_s=10_000,
+                 max_hold_s=500, hold_grace_s=50, clock=clock)
+
+
+def test_reacquire_cannot_reset_since_or_raise_the_limit_while_others_wait(tmp_path, clock):
+    s = _guarded(tmp_path, clock)
+    s.acquire_step("gpu", "hog")
+    since = s.status("gpu")["holder"]["since"]
+    t = s.acquire_step("gpu", "next")["ticket"]
+    for _ in range(5):  # 450 s of re-acquires, each asking for a longer max hold
+        clock.advance(90)
+        assert s.acquire_step("gpu", "hog", max_hold_s=100_000)["reacquired"]
+    h = s.status("gpu")["holder"]
+    assert h["since"] == since and h["guard"]["max_hold_s"] == 500
+    clock.advance(60)  # held 510 s
+    with pytest.raises(OverMaxHold):
+        s.acquire_step("gpu", "hog")
+    clock.advance(41)  # 551 s > 500 + 50
+    assert s.acquire_step("gpu", "next", ticket=t)["state"] == "acquired"
+
+
+def test_waiter_leaving_mid_grace_stops_the_eviction_and_a_new_one_gets_a_full_grace(tmp_path, clock):
+    s = _guarded(tmp_path, clock)
+    s.acquire_step("gpu", "hog")
+    t = s.acquire_step("gpu", "next")["ticket"]
+    clock.advance(520)
+    with pytest.raises(OverMaxHold):
+        s.renew("gpu", "hog")
+    s.cancel("gpu", t)  # the only waiter leaves during the grace
+    clock.advance(100)  # past the old eviction deadline
+    assert s.status("gpu")["holder"]["owner"] == "hog"
+    s.renew("gpu", "hog")  # nobody waits: no limit again
+    t2 = s.acquire_step("gpu", "late")["ticket"]
+    assert s.status("gpu")["holder"]["guard"]["evict_in_s"] == 50  # from the new waiter's arrival
+    with pytest.raises(OverMaxHold):
+        s.renew("gpu", "hog")
+    clock.advance(51)
+    assert s.acquire_step("gpu", "late", ticket=t2)["state"] == "acquired"
+    assert kinds(s).count("evict_max_hold") == 1
+
+
+def test_a_restart_across_the_eviction_deadline_evicts_at_once(tmp_path, clock):
+    s = _guarded(tmp_path, clock)
+    s.acquire_step("gpu", "hog")
+    t = s.acquire_step("gpu", "next")["ticket"]
+    clock.advance(520)
+    s.close()
+    clock.advance(100)  # the server was down while the deadline (550 s) passed
+    s = _guarded(tmp_path, clock)
+    assert s.acquire_step("gpu", "next", ticket=t)["state"] == "acquired"
+    assert "evict_max_hold" in kinds(s)
+    s.close()
