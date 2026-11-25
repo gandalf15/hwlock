@@ -139,7 +139,7 @@ By default the port is bound to **127.0.0.1:8770**. To serve it on the LAN, set 
 
 ```bash
 echo "HWLOCK_TOKEN=$(openssl rand -hex 16)" >> .env
-echo "HWLOCK_BIND=0.0.0.0" >> .env      # or one interface IP
+echo "HWLOCK_BIND=0.0.0.0" >> .env      # all interfaces; a single LAN IP would stop 127.0.0.1 answering
 docker compose up -d
 ```
 

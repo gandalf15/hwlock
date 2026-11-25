@@ -98,7 +98,8 @@ The Jetson cannot reach `127.0.0.1:8770` on the PC. There are two ways to fix th
 
    ```bash
    cd ~/code/hwlock
-   printf 'HWLOCK_TOKEN=%s\nHWLOCK_BIND=192.168.0.197\n' "$(openssl rand -hex 16)" > .env   # PC's LAN IP; .env is gitignored
+   # 0.0.0.0, not the LAN IP: publishing on one IP stops answering on 127.0.0.1 (the PC's own clients).
+   printf 'HWLOCK_TOKEN=%s\nHWLOCK_BIND=0.0.0.0\n' "$(openssl rand -hex 16)" > .env   # .env is gitignored
    docker compose up -d
    mkdir -p ~/.config/hwlock && printf 'url=http://127.0.0.1:8770\ntoken=%s\n' "$(sed -n 's/^HWLOCK_TOKEN=//p' .env)" > ~/.config/hwlock/config
    chmod 600 .env ~/.config/hwlock/config
@@ -106,6 +107,7 @@ The Jetson cannot reach `127.0.0.1:8770` on the PC. There are two ways to fix th
 
    Once a token is set, every client needs it. The `~/.config/hwlock/config` file gives it to every PC shell and agent without any exports. The browser page becomes `http://127.0.0.1:8770/?token=…`.
 2. On the Jetson, create `~/.config/hwlock/config` with `url=http://192.168.0.197:8770` and the same token, mode 600.
+   The PC's address 192.168.0.197 comes from DHCP. Give it a DHCP reservation (or use a hostname that resolves on the Jetson). If the address changes, `need_lock` fails safe and aborts.
 3. In both quant scripts, replace `need_lock()` with:
 
    ```bash
@@ -148,7 +150,14 @@ mv scripts/jetson-lock.new scripts/jetson-lock
 git add scripts/jetson-lock tools/quant/jetson_prep.sh tools/quant/run_parakeet_matrix.sh
 git commit -m "scripts/jetson-lock: thin wrapper over the hwlock service (resource jetson); same verbs"
 
-# 4. Smoke test through the new path.
+# 4. The quant scripts run ON the Jetson: copy the changed ones there, under the new lock, while Andrea is
+#    idle (CLAUDE.md deploy rule: no "speech start" in the journal for 60 s; never rsync --delete).
+scripts/jetson-lock run migration-sync "sync quant need_lock" -- true   # proves the new lock works first
+~/code/hwlock/client/hwlock acquire jetson migration-sync "sync quant need_lock"
+rsync -a tools/quant/jetson_prep.sh tools/quant/run_parakeet_matrix.sh marcel@192.168.0.99:andrea/tools/quant/   # the Jetson copy lives in ~/andrea
+~/code/hwlock/client/hwlock release jetson migration-sync
+
+# 5. Smoke test through the new path.
 scripts/jetson-lock acquire migration-smoke "smoke test" && scripts/jetson-lock status
 scripts/jetson-lock release migration-smoke
 scripts/jetson-lock run migration-smoke "smoke ssh" -- true; echo "run rc=$?"   # 0, and the lock is free again
