@@ -54,10 +54,16 @@ class Config:
 def _peer_alive(sock: socket.socket) -> bool:
     """False when the client already closed its side of the connection (process died, Ctrl-C)."""
     try:
-        readable, _, _ = select.select([sock], [], [], 0)
-        if not readable:
+        p = select.poll()  # not select.select: that fails for fds >= 1024 (many open connections)
+        p.register(sock, select.POLLIN | select.POLLHUP | select.POLLERR)
+        ev = p.poll(0)
+        if not ev:
             return True
-        return bool(sock.recv(1, socket.MSG_PEEK))
+        if ev[0][1] & select.POLLIN:
+            return bool(sock.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT))
+        return False
+    except BlockingIOError:
+        return True
     except (OSError, ValueError):
         return False
 

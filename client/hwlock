@@ -23,7 +23,8 @@ Re-acquiring a resource you (same owner) already hold succeeds at once and refre
 Env: HWLOCK_URL (default http://127.0.0.1:8770), HWLOCK_TOKEN (bearer token, optional). Without them,
 `url=` and `token=` lines in ~/.config/hwlock/config (or $HWLOCK_CONFIG) are used.
 
-Exit codes: 0 ok | 1 not the holder / not held (renew, release, force-release) | 2 usage error |
+Exit codes: 0 ok | 1 not the holder / not held (renew, release, force-release), or renew/re-acquire
+refused: held longer than the server's max hold while others wait (OVER_MAX_HOLD) | 2 usage error |
 3 gave up after --max-wait | 4 server unreachable or rejected the request (auth, bad input) |
 130 interrupted while waiting | run: the command's exit code (128+N if killed by signal N).
 """

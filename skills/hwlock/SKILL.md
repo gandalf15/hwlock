@@ -27,9 +27,12 @@ measurements, run out of memory or break deploys. The `hwlock` service serialise
    and never kill another agent's process to get the device. If something looks stuck, report it to the user.
 7. If `renew`/`release` prints `NOT_HOLDER` or `run` warns "lost", your lease expired: stop touching the
    device, re-acquire, and redo the step whose result is now suspect.
+8. If `renew` prints `OVER_MAX_HOLD` or `run` warns about it, you have held the device too long while others
+   wait, and you will be evicted after a grace period (the message says when): finish or stop the current
+   step, release, and `acquire` again (back of the queue) if you still need the device.
 
 ## Exit codes
-0 ok - 1 not the holder - 2 usage - 3 gave up (`--max-wait`) - 4 server unreachable/rejected
+0 ok - 1 not the holder (or `OVER_MAX_HOLD`) - 2 usage - 3 gave up (`--max-wait`) - 4 server unreachable/rejected
 (check `HWLOCK_URL`, `HWLOCK_TOKEN`) - 130 interrupted - `run`: the command's code.
 
 ## Setup (only if `hwlock` is not on PATH)

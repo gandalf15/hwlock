@@ -46,7 +46,7 @@ hwlock force-release <resource> <by> [reason]      # admin, logged
 | Exit | Meaning |
 |---|---|
 | 0 | Success. |
-| 1 | You are not the holder (`renew`/`release`), or the resource is not held (`force-release`). The output is `NOT_HOLDER holder=<owner>`. |
+| 1 | You are not the holder (`renew`/`release`), or the resource is not held (`force-release`). The output is `NOT_HOLDER holder=<owner>`. With the starvation guard on (`HWLOCK_MAX_HOLD_S`), also when `renew` or a re-`acquire` is refused because you held it too long while others wait: `OVER_MAX_HOLD waiting=N`. |
 | 2 | Usage error. |
 | 3 | Gave up after `--max-wait`. The ticket was withdrawn. |
 | 4 | The server is unreachable, or it rejected the request: wrong token or invalid input. |

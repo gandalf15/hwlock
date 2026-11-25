@@ -100,7 +100,8 @@ The Jetson cannot reach `127.0.0.1:8770` on the PC. There are two ways to fix th
    ```bash
    cd ~/code/hwlock
    # 0.0.0.0, not the LAN IP: publishing on one IP stops answering on 127.0.0.1 (the PC's own clients).
-   printf 'HWLOCK_TOKEN=%s\nHWLOCK_BIND=0.0.0.0\n' "$(openssl rand -hex 16)" >> .env   # .env is gitignored
+   grep -q '^HWLOCK_TOKEN=' .env 2>/dev/null ||   # once only: a second token line would split clients and server
+     printf 'HWLOCK_TOKEN=%s\nHWLOCK_BIND=0.0.0.0\n' "$(openssl rand -hex 16)" >> .env   # .env is gitignored
    docker compose up -d
    mkdir -p ~/.config/hwlock && printf 'url=http://127.0.0.1:8770\ntoken=%s\n' "$(sed -n 's/^HWLOCK_TOKEN=//p' .env)" > ~/.config/hwlock/config
    chmod 600 .env ~/.config/hwlock/config

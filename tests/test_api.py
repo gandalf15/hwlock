@@ -207,3 +207,32 @@ def test_restart_persists_holder_queue_and_lease_clock(make_server):
         assert st == 200, out
     kinds = [e["kind"] for e in api.events()]
     assert kinds.count("server_start") == 2
+
+
+def test_peer_check_works_for_high_file_descriptors():
+    """Connections past fd 1024 (a busy server) must not all look dead (select.select fails there)."""
+    import resource
+    import socket
+
+    from hwlock_server.web import _peer_alive
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if hard != resource.RLIM_INFINITY and hard < 1200:
+        import pytest
+        pytest.skip("fd limit too low")
+    resource.setrlimit(resource.RLIMIT_NOFILE, (max(soft, 1200), hard))
+    pad = [open("/dev/null") for _ in range(1050)]
+    try:
+        a, b = socket.socketpair()
+        assert a.fileno() >= 1024
+        assert _peer_alive(a)
+        b.sendall(b"x")
+        assert _peer_alive(a)
+        b.close()
+        a.recv(1)
+        assert not _peer_alive(a)
+        a.close()
+    finally:
+        for f in pad:
+            f.close()
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
