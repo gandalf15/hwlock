@@ -7,10 +7,16 @@ and two holders are impossible (the holder is a set of columns on the resource r
 Time: leases and heartbeats use the server's wall clock (absolute epoch seconds), so a lease keeps
 counting while the server is down. Long-poll deadlines use a monotonic clock.
 
-Grant rule (same as the bash prototype): the lock goes only to the FIRST waiting ticket, and only
+Grant rule (same as the bash prototype): the lock goes only to the FIRST live waiting ticket, and only
 while that ticket's own client is actively asking for it (an acquire request is in flight and its
-connection is still open). A dead waiter therefore never receives the lock; it stops heartbeating and
-its ticket is dropped after `heartbeat_s`.
+connection is still open). A dead waiter therefore never receives the lock.
+
+Dormant tickets (re-attach window): when a waiting client hangs up (killed, tool timeout) or detaches
+(SIGTERM), its ticket turns DORMANT for `reattach_s`: it keeps its id, so its place in the FIFO, but is
+skipped while dormant (it never blocks a free lock and never counts as a waiter for the starvation guard).
+An acquire by the same owner on the same resource within the window re-attaches to it (by owner, or by
+ticket id) and is live again at its old place among the tickets not yet served. After the window it is
+dropped. A live ticket that stops heartbeating for `heartbeat_s` is dropped as before.
 """
 
 from __future__ import annotations
@@ -48,7 +54,9 @@ CREATE TABLE IF NOT EXISTS tickets (
     host      TEXT,
     pid       INTEGER,
     created   REAL NOT NULL,
-    last_seen REAL NOT NULL
+    last_seen REAL NOT NULL,
+    dormant_until REAL,
+    live_since REAL
 );
 CREATE INDEX IF NOT EXISTS tickets_resource ON tickets(resource, id);
 CREATE TABLE IF NOT EXISTS events (
@@ -129,6 +137,7 @@ class Store:
         hold_grace_s: float = 300,
         resource_max_hold_s: dict | None = None,
         resource_hold_grace_s: dict | None = None,
+        reattach_s: float = 120,
         clock: Callable[[], float] = time.time,
         log: Callable[[str], None] | None = None,
     ):
@@ -137,6 +146,8 @@ class Store:
         self.default_lease_s = default_lease_s
         self.max_lease_s = max_lease_s
         self.heartbeat_s = heartbeat_s
+        # how long a hung-up waiter's ticket stays dormant (re-attachable at its place); 0 = dropped at once
+        self.reattach_s = float(reattach_s)
         # Starvation guard (0 = off): while others wait, a holder may keep the lock at most max_hold_s
         # from when it took it; after that renew/re-acquire is refused, and hold_grace_s later it is evicted.
         # Per-resource values (resource_*) override the global ones; see guard().
@@ -160,11 +171,18 @@ class Store:
         cols = {c["name"] for c in self.db.execute("PRAGMA table_info(resources)")}
         if "holder_max_hold_s" not in cols:
             self.db.execute("ALTER TABLE resources ADD COLUMN holder_max_hold_s REAL")
+        cols = {c["name"] for c in self.db.execute("PRAGMA table_info(tickets)")}
+        for col in ("dormant_until", "live_since"):
+            if col not in cols:
+                self.db.execute(f"ALTER TABLE tickets ADD COLUMN {col} REAL")
+        self.db.execute("UPDATE tickets SET live_since=created WHERE live_since IS NULL")
         with self._tx() as now:
             # Waiting clients could not heartbeat while we were down: give them a fresh window to
-            # re-attach by ticket id. Holders keep their absolute expiry (leases keep counting).
-            n = self.db.execute("UPDATE tickets SET last_seen=?", (now,)).rowcount
-            self._event(now, None, "server_start", detail={"waiting_tickets": n})
+            # re-attach by ticket id. Holders keep their absolute expiry (leases keep counting), and so do
+            # dormant tickets their re-attach deadline (dropped by the next sweep if it passed meanwhile).
+            n = self.db.execute("UPDATE tickets SET last_seen=? WHERE dormant_until IS NULL", (now,)).rowcount
+            d = self.db.execute("SELECT COUNT(*) FROM tickets WHERE dormant_until IS NOT NULL").fetchone()[0]
+            self._event(now, None, "server_start", detail={"waiting_tickets": n, "dormant_tickets": d})
 
     # ------------------------------------------------------------------ plumbing
     @contextmanager
@@ -240,16 +258,24 @@ class Store:
                         {"held_s": round(now - r["since"], 3), "overdue_s": round(now - r["expires"], 3)})
             changes += 1
         for t in self.db.execute(
-            "SELECT * FROM tickets WHERE last_seen < ?", (now - self.heartbeat_s,)
+            "SELECT * FROM tickets WHERE dormant_until IS NULL AND last_seen < ?", (now - self.heartbeat_s,)
         ).fetchall():
             self.db.execute("DELETE FROM tickets WHERE id=?", (t["id"],))
             self._event(now, t["resource"], "drop", t["owner"], t["id"],
                         {"silent_s": round(now - t["last_seen"], 3)})
             changes += 1
-        # after dropping dead tickets: only live waiters can evict a holder
+        for t in self.db.execute(
+            "SELECT * FROM tickets WHERE dormant_until IS NOT NULL AND dormant_until <= ?", (now,)
+        ).fetchall():
+            self.db.execute("DELETE FROM tickets WHERE id=?", (t["id"],))
+            self._event(now, t["resource"], "ticket_dropped", t["owner"], t["id"],
+                        {"why": "reattach_window", "overdue_s": round(now - t["dormant_until"], 3)})
+            changes += 1
+        # after dropping dead tickets: only live waiters can evict a holder (dormant ones never do)
         for r in self.db.execute(
             "SELECT * FROM resources WHERE holder_owner IS NOT NULL"
-            " AND EXISTS (SELECT 1 FROM tickets WHERE tickets.resource = resources.name)"
+            " AND EXISTS (SELECT 1 FROM tickets WHERE tickets.resource = resources.name"
+            " AND tickets.dormant_until IS NULL)"
         ).fetchall():
             g = self._guard(r, now)
             if g and g["evict_at"] <= now:
@@ -295,8 +321,9 @@ class Store:
         if limit <= 0:
             return None
         g = {"max_hold_s": limit, "grace_s": grace}
-        q = self.db.execute("SELECT COUNT(*), MIN(created) FROM tickets WHERE resource=?",
-                            (r["name"],)).fetchone()
+        # live waiters only; a re-attached ticket counts from its re-attach, not from its creation
+        q = self.db.execute("SELECT COUNT(*), MIN(live_since) FROM tickets WHERE resource=?"
+                            " AND dormant_until IS NULL", (r["name"],)).fetchone()
         if q[0]:
             refuse_at = r["since"] + limit
             evict_at = max(refuse_at, q[1]) + grace
@@ -321,9 +348,42 @@ class Store:
             lease_left_s=round(r["expires"] - now, 3))
 
     def _position(self, resource, ticket_id) -> int:
+        """1-based place among the live tickets (dormant ones are skipped while dormant)."""
         return self.db.execute(
-            "SELECT COUNT(*) FROM tickets WHERE resource=? AND id<=?", (resource, ticket_id)
-        ).fetchone()[0]
+            "SELECT COUNT(*) FROM tickets WHERE resource=? AND id<=? AND dormant_until IS NULL",
+            (resource, ticket_id)).fetchone()[0]
+
+    def _go_dormant(self, now, t, via: str) -> dict:
+        """A live waiting ticket's client is gone: keep its place for reattach_s (0: drop it now).
+        `via` is "disconnect" (connection closed; also logged as "abandon") or "detach" (client asked)."""
+        if self.reattach_s <= 0:
+            self.db.execute("DELETE FROM tickets WHERE id=?", (t["id"],))
+            self._event(now, t["resource"], "ticket_dropped", t["owner"], t["id"], {"why": via, "window_s": 0})
+            state = "dropped"
+        else:
+            self.db.execute("UPDATE tickets SET dormant_until=? WHERE id=?", (now + self.reattach_s, t["id"]))
+            self._event(now, t["resource"], "ticket_dormant", t["owner"], t["id"],
+                        {"via": via, "window_s": self.reattach_s})
+            state = "dormant"
+        if via == "disconnect":
+            self._event(now, t["resource"], "abandon", t["owner"], t["id"])
+        return {"state": state, "resource": t["resource"], "ticket": t["id"], "window_s": self.reattach_s}
+
+    def _reattach(self, now, t, reason, host, pid, how: str) -> bool:
+        """Bring a ticket back to life for a (new) client of its owner. Returns True when it was dormant."""
+        if t["dormant_until"] is None:
+            self.db.execute("UPDATE tickets SET last_seen=? WHERE id=?", (now, t["id"]))
+            if how == "owner":  # a second live client of the same owner: shares the ticket
+                self._event(now, t["resource"], "ticket_reattached", t["owner"], t["id"],
+                            {"how": how, "was": "live", "pid": pid})
+            return False
+        self.db.execute(
+            "UPDATE tickets SET dormant_until=NULL, live_since=?, last_seen=?, reason=COALESCE(?, reason),"
+            " host=COALESCE(?, host), pid=COALESCE(?, pid) WHERE id=?", (now, now, reason, host, pid, t["id"]))
+        self._event(now, t["resource"], "ticket_reattached", t["owner"], t["id"],
+                    {"how": how, "was": "dormant", "window_left_s": round(t["dormant_until"] - now, 3),
+                     "pid": pid})
+        return True
 
     # ------------------------------------------------------------------ operations
     def _max_hold(self, value: Any) -> float | None:
@@ -341,18 +401,27 @@ class Store:
         return v
 
     def acquire_step(self, resource, owner, *, reason=None, host=None, pid=None, lease_s=None,
-                     ticket=None, max_hold_s=None, may_grant: Callable[[], bool] = lambda: True) -> dict:
-        """One non-blocking acquire attempt. Creates a ticket when `ticket` is None.
+                     ticket=None, max_hold_s=None, new_ticket=False, revive=True,
+                     may_grant: Callable[[], bool] = lambda: True) -> dict:
+        """One non-blocking acquire attempt.
 
+        Without `ticket`: re-attaches to this owner's ticket for the resource if it has one (dormant or
+        live; "reattached": true), else creates one. `new_ticket` drops this owner's old ticket(s) first
+        and always joins at the back. With `ticket`: continues with it (reviving it if dormant).
         Returns {"state": "acquired", ...} or {"state": "waiting", "ticket", "position", "holder"};
-        {"state": "abandoned"} when it was this ticket's turn but `may_grant()` said the client is gone.
-        Raises TicketGone when `ticket` no longer exists (dropped/cancelled): rejoin with a new one.
+        {"state": "abandoned"} when it was this ticket's turn but `may_grant()` said the client is gone
+        (the ticket is then dormant). Raises TicketGone when `ticket` no longer exists (dropped/cancelled).
+        revive=False (the long-poll's own re-checks): a ticket that went dormant meanwhile (its client
+        detached) is not revived; returns {"state": "dormant"} so that request ends. Only a new request
+        from a client re-attaches.
         """
         _name(resource, "resource")
         _name(owner, "owner")
         lease = self._lease(lease_s)
         reason, host, pid = _text(reason), _text(host), _pid(pid)
         max_hold = self._max_hold(max_hold_s)
+        if not isinstance(new_ticket, bool):
+            raise BadRequest(f"new_ticket must be true or false: {new_ticket!r}")
         if ticket is not None:
             try:
                 ticket = int(ticket)
@@ -374,12 +443,28 @@ class Store:
                 r = self._resource(now, resource)
                 return {"state": "acquired", "resource": resource, "ticket": r["holder_ticket"],
                         "reacquired": True, "holder": self._holder(r, now)}
+            reattached = False
             if ticket is None:
-                cur = self.db.execute(
-                    "INSERT INTO tickets(resource, owner, reason, host, pid, created, last_seen)"
-                    " VALUES (?,?,?,?,?,?,?)", (resource, owner, reason, host, pid, now, now))
-                ticket = cur.lastrowid
-                self._event(now, resource, "enqueue", owner, ticket, {"reason": reason, "host": host})
+                mine = self.db.execute("SELECT * FROM tickets WHERE resource=? AND owner=? ORDER BY id",
+                                       (resource, owner)).fetchall()
+                if new_ticket:
+                    for old in mine:
+                        self.db.execute("DELETE FROM tickets WHERE id=?", (old["id"],))
+                        self._event(now, resource, "ticket_dropped", owner, old["id"],
+                                    {"why": "new_ticket", "was": "live" if old["dormant_until"] is None
+                                     else "dormant"})
+                    mine = []
+                if mine:
+                    t = mine[0]
+                    ticket = t["id"]
+                    self._reattach(now, t, reason, host, pid, "owner")
+                    reattached = True
+                else:
+                    cur = self.db.execute(
+                        "INSERT INTO tickets(resource, owner, reason, host, pid, created, last_seen, live_since)"
+                        " VALUES (?,?,?,?,?,?,?,?)", (resource, owner, reason, host, pid, now, now, now))
+                    ticket = cur.lastrowid
+                    self._event(now, resource, "enqueue", owner, ticket, {"reason": reason, "host": host})
                 t = self.db.execute("SELECT * FROM tickets WHERE id=?", (ticket,)).fetchone()
             else:
                 t = self.db.execute("SELECT * FROM tickets WHERE id=? AND resource=?",
@@ -387,16 +472,20 @@ class Store:
                 if t is None or t["owner"] != owner:
                     raise TicketGone(f"ticket {ticket} is not waiting for {resource} (dropped, cancelled"
                                      " or granted to someone else); take a new one", ticket=ticket)
-                self.db.execute("UPDATE tickets SET last_seen=? WHERE id=?", (now, ticket))
+                if t["dormant_until"] is not None and not revive:
+                    return {"state": "dormant", "resource": resource, "ticket": ticket,
+                            "dormant_left_s": round(t["dormant_until"] - now, 3)}
+                reattached = self._reattach(now, t, reason, host, pid, "ticket")
+                t = self.db.execute("SELECT * FROM tickets WHERE id=?", (ticket,)).fetchone()
             first = self.db.execute(
-                "SELECT MIN(id) FROM tickets WHERE resource=?", (resource,)).fetchone()[0]
+                "SELECT MIN(id) FROM tickets WHERE resource=? AND dormant_until IS NULL",
+                (resource,)).fetchone()[0]
             if r["holder_owner"] is None and first == ticket:
                 if not may_grant():
-                    # Its turn, but the client already hung up (killed, Ctrl-C): never hand the lock
-                    # to a dead waiter; drop the ticket so the next one goes now, not after heartbeat_s.
-                    self.db.execute("DELETE FROM tickets WHERE id=?", (ticket,))
-                    self._event(now, resource, "abandon", owner, ticket)
-                    return {"state": "abandoned", "resource": resource, "ticket": ticket}
+                    # Its turn, but the client already hung up (killed, tool timeout): never hand the
+                    # lock to a dead waiter; the ticket goes dormant so the next one is served now.
+                    out = self._go_dormant(now, t, "disconnect")
+                    return {**out, "state": "abandoned"}
                 self.db.execute("DELETE FROM tickets WHERE id=?", (ticket,))
                 self.db.execute(
                     "UPDATE resources SET holder_owner=?, holder_reason=?, holder_host=?, holder_pid=?,"
@@ -409,11 +498,15 @@ class Store:
                              **({"max_hold_s": max_hold} if max_hold else {})})
                 r = self._resource(now, resource)
                 return {"state": "acquired", "resource": resource, "ticket": ticket,
-                        "reacquired": False, "holder": self._holder(r, now)}
-            return {"state": "waiting", "resource": resource, "ticket": ticket,
+                        "reacquired": False, "reattached": reattached, "holder": self._holder(r, now)}
+            return {"state": "waiting", "resource": resource, "ticket": ticket, "reattached": reattached,
                     "position": self._position(resource, ticket),
                     "queue_length": self.db.execute(
-                        "SELECT COUNT(*) FROM tickets WHERE resource=?", (resource,)).fetchone()[0],
+                        "SELECT COUNT(*) FROM tickets WHERE resource=? AND dormant_until IS NULL",
+                        (resource,)).fetchone()[0],
+                    "dormant_ahead": self.db.execute(
+                        "SELECT COUNT(*) FROM tickets WHERE resource=? AND id<? AND dormant_until IS NOT NULL",
+                        (resource, ticket)).fetchone()[0],
                     "holder": self._holder(r, now)}
 
     def acquire(self, resource, owner, *, wait_s: float = 0, may_grant: Callable[[], bool] = lambda: True,
@@ -423,8 +516,8 @@ class Store:
 
         Each attempt refreshes the ticket's heartbeat (on every state change and at least every
         heartbeat_s/4). The client's connection is checked about once a second: when it is gone
-        (killed, Ctrl-C) the ticket is dropped at once ("abandon"), so a dead waiter never blocks the
-        queue until its heartbeat times out.
+        (killed, tool timeout) the ticket turns dormant at once ("abandon" + "ticket_dormant"), so a
+        dead waiter never blocks the queue, yet a re-run of the same acquire gets its place back.
         """
         deadline = time.monotonic() + max(0.0, float(wait_s))
         touch_s = max(0.05, self.heartbeat_s / 4)
@@ -446,18 +539,65 @@ class Store:
                 if not may_grant():
                     return self._abandon(resource, owner, res["ticket"])
                 if self.changes != seen_changes or time.monotonic() - last_step >= touch_s or time.monotonic() >= deadline:
-                    res = self.acquire_step(resource, owner, may_grant=may_grant, **kw)
+                    res = self.acquire_step(resource, owner, may_grant=may_grant, revive=False, **kw)
                     last_step = time.monotonic()
+                    if res["state"] == "dormant":  # detached by its client meanwhile: end this request
+                        return {**res, "state": "waiting", "dormant": True}
             if res["state"] == "waiting" and not may_grant():
                 return self._abandon(resource, owner, res["ticket"])
             return res
 
     def _abandon(self, resource, owner, ticket) -> dict:
-        """The waiting client hung up: withdraw its ticket now."""
+        """The waiting client hung up: its ticket goes dormant now (once; it may already be)."""
         with self._tx() as now:
-            if self.db.execute("DELETE FROM tickets WHERE id=? AND resource=?", (ticket, resource)).rowcount:
-                self._event(now, resource, "abandon", owner, ticket)
+            t = self.db.execute("SELECT * FROM tickets WHERE id=? AND resource=? AND dormant_until IS NULL",
+                                (ticket, resource)).fetchone()
+            if t is not None:
+                self._go_dormant(now, t, "disconnect")
         return {"state": "abandoned", "resource": resource, "ticket": ticket}
+
+    def detach(self, resource, ticket=None, owner=None) -> dict:
+        """The waiting client is going away but wants to keep its place (SIGTERM, e.g. a tool timeout):
+        its ticket goes dormant for reattach_s. Without `ticket`, the owner's live tickets on the resource.
+        If that ticket (by id) was granted meanwhile (the grant raced the signal), the lock is released, as
+        by cancel: the client is exiting without knowing it holds."""
+        _name(resource, "resource")
+        if owner is not None:
+            _name(owner, "owner")
+        if ticket is None and owner is None:
+            raise BadRequest("detach needs a ticket or an owner")
+        if ticket is not None:
+            try:
+                ticket = int(ticket)
+            except (TypeError, ValueError, OverflowError):
+                raise BadRequest(f"ticket must be an integer: {ticket!r}") from None
+        with self._tx() as now:
+            self._sweep(now)
+            if ticket is not None:
+                rows = self.db.execute("SELECT * FROM tickets WHERE id=? AND resource=?",
+                                       (ticket, resource)).fetchall()
+                rows = [t for t in rows if owner is None or t["owner"] == owner]
+            else:
+                rows = self.db.execute("SELECT * FROM tickets WHERE resource=? AND owner=?",
+                                       (resource, owner)).fetchall()
+            out = None
+            for t in rows:
+                if t["dormant_until"] is None:
+                    out = self._go_dormant(now, t, "detach")
+                else:
+                    out = {"state": "dormant", "resource": resource, "ticket": t["id"],
+                           "window_s": self.reattach_s}
+            if out is not None:
+                return out
+            r = self._resource(now, resource, create=False)
+            # only by ticket id: an owner-only detach must never release a hold taken earlier
+            if (ticket is not None and r is not None and r["holder_owner"] is not None
+                    and r["holder_ticket"] == ticket and (owner is None or owner == r["holder_owner"])):
+                self._clear(resource)
+                self._event(now, resource, "release", r["holder_owner"], r["holder_ticket"],
+                            {"held_s": round(now - r["since"], 3), "via": "detach"})
+                return {"state": "released", "resource": resource, "ticket": r["holder_ticket"]}
+            return {"state": "unknown", "resource": resource, "ticket": ticket}
 
     def renew(self, resource, owner, *, lease_s=None) -> dict:
         _name(resource, "resource")
@@ -535,14 +675,18 @@ class Store:
 
     # ------------------------------------------------------------------ queries
     def _resource_status(self, r, now) -> dict:
-        queue = []
-        for i, t in enumerate(self.db.execute(
-                "SELECT * FROM tickets WHERE resource=? ORDER BY id", (r["name"],)).fetchall(), 1):
-            queue.append({"position": i, "ticket": t["id"], "owner": t["owner"], "reason": t["reason"],
-                          "host": t["host"], "pid": t["pid"], "waiting_s": round(now - t["created"], 3),
-                          "last_seen_s": round(now - t["last_seen"], 3)})
+        queue, dormant = [], []
+        for t in self.db.execute("SELECT * FROM tickets WHERE resource=? ORDER BY id", (r["name"],)).fetchall():
+            e = {"ticket": t["id"], "owner": t["owner"], "reason": t["reason"], "host": t["host"],
+                 "pid": t["pid"], "waiting_s": round(now - t["created"], 3)}
+            if t["dormant_until"] is None:
+                queue.append({"position": len(queue) + 1, **e, "last_seen_s": round(now - t["last_seen"], 3)})
+            else:
+                # its place if re-attached now: right after the live tickets ahead of it
+                dormant.append({**e, "position_on_reattach": len(queue) + 1,
+                                "dormant_left_s": round(t["dormant_until"] - now, 3)})
         return {"resource": r["name"], "free": r["holder_owner"] is None,
-                "holder": self._holder(r, now), "queue": queue}
+                "holder": self._holder(r, now), "queue": queue, "dormant": dormant}
 
     def status(self, resource: str | None = None) -> dict:
         with self.lock:
@@ -552,7 +696,8 @@ class Store:
                 _name(resource, "resource")
                 r = self.db.execute("SELECT * FROM resources WHERE name=?", (resource,)).fetchone()
                 if r is None:
-                    return {"now": now, "resource": resource, "free": True, "holder": None, "queue": []}
+                    return {"now": now, "resource": resource, "free": True, "holder": None, "queue": [],
+                            "dormant": []}
                 return {"now": now, **self._resource_status(r, now)}
             rows = self.db.execute("SELECT * FROM resources ORDER BY name").fetchall()
             return {"now": now, "resources": [self._resource_status(r, now) for r in rows]}

@@ -492,3 +492,214 @@ def test_a_restart_across_the_eviction_deadline_evicts_at_once(tmp_path, clock):
     assert s.acquire_step("gpu", "next", ticket=t)["state"] == "acquired"
     assert "evict_max_hold" in kinds(s)
     s.close()
+
+
+# ---------------------------------------------------------------- dormant tickets (re-attach window)
+def _hang_up(s, res, owner, ticket):
+    """The waiting client's connection closes while it is first in line (killed, tool timeout)."""
+    return s.acquire_step(res, owner, ticket=ticket, may_grant=lambda: False)
+
+
+def test_hung_up_ticket_is_dormant_and_a_rerun_reattaches_to_its_place(store, clock):
+    store.acquire_step("gpu", "holder")
+    early = store.acquire_step("gpu", "early")["ticket"]
+    assert store.detach("gpu", early, "early")["state"] == "dormant"
+    late = store.acquire_step("gpu", "late")["ticket"]
+    st = store.status("gpu")
+    assert [q["owner"] for q in st["queue"]] == ["late"]
+    assert [(d["owner"], d["ticket"], d["dormant_left_s"]) for d in st["dormant"]] == [("early", early, 120)]
+    clock.advance(30)
+    out = store.acquire_step("gpu", "early", pid=99)  # a new process, no ticket id: re-attach by owner
+    assert out["ticket"] == early and out["reattached"] and out["position"] == 1
+    assert [q["ticket"] for q in store.status("gpu")["queue"]] == [early, late]
+    assert store.status("gpu")["queue"][0]["pid"] == 99
+    store.release("gpu", "holder")
+    assert store.acquire_step("gpu", "late", ticket=late)["state"] == "waiting"
+    assert store.acquire_step("gpu", "early", ticket=early)["state"] == "acquired"
+    assert ["ticket_dormant", "ticket_reattached"] == [k for k in kinds(store) if k.startswith("ticket_")]
+
+
+def test_dormant_ticket_never_blocks_a_free_lock(store):
+    store.acquire_step("gpu", "a")
+    b = store.acquire_step("gpu", "b")["ticket"]
+    c = store.acquire_step("gpu", "c")["ticket"]
+    store.release("gpu", "a")
+    assert _hang_up(store, "gpu", "b", b)["state"] == "abandoned"  # its turn, but its client is gone
+    assert store.status("gpu")["holder"] is None
+    assert [d["ticket"] for d in store.status("gpu")["dormant"]] == [b]
+    assert store.acquire_step("gpu", "c", ticket=c)["state"] == "acquired"
+    store.release("gpu", "c")
+    assert store.acquire_step("gpu", "d")["state"] == "acquired"  # only a dormant ticket left: free
+    assert kinds(store).count("abandon") == 1 and kinds(store).count("ticket_dormant") == 1
+
+
+def test_dormant_ticket_is_dropped_after_its_window(store, clock):
+    store.acquire_step("gpu", "a")
+    b = store.acquire_step("gpu", "b")["ticket"]
+    store.detach("gpu", b, "b")
+    clock.advance(119)
+    store.sweep()
+    assert [d["ticket"] for d in store.status("gpu")["dormant"]] == [b]
+    clock.advance(2)
+    store.sweep()
+    assert store.status("gpu")["dormant"] == [] and store.status("gpu")["queue"] == []
+    assert kinds(store)[-1] == "ticket_dropped"
+    with pytest.raises(TicketGone):
+        store.acquire_step("gpu", "b", ticket=b)
+    out = store.acquire_step("gpu", "b")
+    assert out["ticket"] > b and not out["reattached"]
+
+
+def test_dormant_window_is_configurable_and_0_drops_at_once(tmp_path, clock):
+    s = Store(str(tmp_path / "w.db"), reattach_s=10, clock=clock)
+    s.acquire_step("gpu", "a")
+    b = s.acquire_step("gpu", "b")["ticket"]
+    assert s.detach("gpu", b, "b")["window_s"] == 10
+    clock.advance(11)
+    s.sweep()
+    assert s.status("gpu")["dormant"] == []
+    s.close()
+    s = Store(str(tmp_path / "z.db"), reattach_s=0, clock=clock)
+    s.acquire_step("gpu", "a")
+    b = s.acquire_step("gpu", "b")["ticket"]
+    s.detach("gpu", b, "b")
+    st = s.status("gpu")
+    assert st["queue"] == [] and st["dormant"] == []
+    s.close()
+
+
+def test_explicit_ticket_id_revives_its_dormant_ticket(store):
+    store.acquire_step("gpu", "a")
+    b = store.acquire_step("gpu", "b")["ticket"]
+    store.detach("gpu", b, "b")
+    out = store.acquire_step("gpu", "b", ticket=b)  # a transient disconnect, then the next poll
+    assert out["state"] == "waiting" and out["ticket"] == b and out["reattached"]
+    assert store.status("gpu")["dormant"] == []
+
+
+def test_cancel_removes_a_dormant_ticket(store):
+    store.acquire_step("gpu", "a")
+    b = store.acquire_step("gpu", "b")["ticket"]
+    store.detach("gpu", b, "b")
+    assert store.cancel("gpu", b, "b")["state"] == "cancelled"
+    assert store.status("gpu")["dormant"] == []
+    assert not store.acquire_step("gpu", "b")["reattached"]
+
+
+def test_new_ticket_drops_the_old_one_and_joins_at_the_back(store):
+    store.acquire_step("gpu", "a")
+    b = store.acquire_step("gpu", "b")["ticket"]
+    store.detach("gpu", b, "b")
+    c = store.acquire_step("gpu", "c")["ticket"]
+    out = store.acquire_step("gpu", "b", new_ticket=True)
+    assert out["ticket"] > c and not out["reattached"]
+    st = store.status("gpu")
+    assert [q["owner"] for q in st["queue"]] == ["c", "b"] and st["dormant"] == []
+
+
+def test_two_live_waiters_with_one_owner_share_one_ticket(store):
+    store.acquire_step("gpu", "a")
+    t1 = store.acquire_step("gpu", "same")["ticket"]
+    out = store.acquire_step("gpu", "same")
+    assert out["ticket"] == t1 and out["reattached"]
+    assert [q["ticket"] for q in store.status("gpu")["queue"]] == [t1]
+
+
+def test_holder_reacquire_stays_immediate_with_a_dormant_ticket_around(store):
+    store.acquire_step("gpu", "me")
+    o = store.acquire_step("gpu", "other")["ticket"]
+    store.detach("gpu", o, "other")
+    assert store.acquire_step("gpu", "me")["reacquired"]
+
+
+def test_detach_of_a_ticket_granted_meanwhile_releases(store):
+    t = store.acquire_step("gpu", "a")["ticket"]
+    assert store.detach("gpu", t, "a")["state"] == "released"
+    assert store.status("gpu")["holder"] is None
+
+
+def test_restart_keeps_dormant_tickets_with_their_remaining_window(tmp_path, clock):
+    path = str(tmp_path / "r.db")
+    s = Store(path, heartbeat_s=60, clock=clock)
+    s.acquire_step("gpu", "a")
+    b = s.acquire_step("gpu", "b")["ticket"]
+    s.detach("gpu", b, "b")
+    c = s.acquire_step("gpu", "c")["ticket"]
+    clock.advance(50)
+    s.close()
+    clock.advance(30)  # down for 30 s: the window keeps counting (wall clock, like leases)
+    s = Store(path, heartbeat_s=60, clock=clock)
+    st = s.status("gpu")
+    assert [(d["ticket"], d["dormant_left_s"]) for d in st["dormant"]] == [(b, 40)]
+    assert [q["ticket"] for q in st["queue"]] == [c]
+    assert s.acquire_step("gpu", "b")["ticket"] == b
+    s.close()
+    clock.advance(10)
+    s = Store(path, heartbeat_s=60, clock=clock)
+    s.detach("gpu", b, "b")
+    s.close()
+    clock.advance(200)  # down longer than the window: dropped on the first sweep
+    s = Store(path, heartbeat_s=60, clock=clock)
+    assert s.status("gpu")["dormant"] == [] and "ticket_dropped" in kinds(s)
+    s.close()
+
+
+def test_dormant_ticket_does_not_count_for_the_guard_and_a_reattach_gets_a_full_grace(tmp_path, clock):
+    def guarded():
+        return Store(str(tmp_path / "g.db"), default_lease_s=900, max_lease_s=1000, heartbeat_s=10_000,
+                     max_hold_s=500, hold_grace_s=50, reattach_s=10_000, clock=clock)
+
+    s = guarded()
+    s.acquire_step("gpu", "hog")
+    w = s.acquire_step("gpu", "w")["ticket"]
+    s.detach("gpu", w, "w")
+    clock.advance(600)  # past max hold, but nobody live waits
+    s.renew("gpu", "hog")
+    assert "waiting" not in s.status("gpu")["holder"]["guard"]
+    s.sweep()
+    assert s.status("gpu")["holder"]["owner"] == "hog"
+    s.close()
+    s = guarded()
+    assert s.acquire_step("gpu", "w")["reattached"]
+    assert s.status("gpu")["holder"]["guard"]["evict_in_s"] == 50  # from the re-attach, not its creation
+    s.close()
+
+
+def test_old_database_gets_the_dormant_columns(tmp_path, clock):
+    import sqlite3
+
+    from hwlock_server import core
+
+    path = str(tmp_path / "old2.db")
+    db = sqlite3.connect(path)
+    db.executescript(core.SCHEMA.replace(",\n    dormant_until REAL", "").replace(",\n    live_since REAL", ""))
+    db.execute("INSERT INTO resources(name, created) VALUES ('gpu', ?)", (clock() - 9,))
+    db.execute("INSERT INTO tickets(resource, owner, created, last_seen) VALUES ('gpu', 'w', ?, ?)",
+               (clock() - 5, clock()))
+    db.commit()
+    assert "dormant_until" not in {r[1] for r in db.execute("PRAGMA table_info(tickets)")}
+    db.close()
+    s = Store(path, clock=clock)
+    q = s.status("gpu")["queue"]
+    assert [x["owner"] for x in q] == ["w"] and q[0]["waiting_s"] == 5
+    s.close()
+    s = Store(path, clock=clock)  # idempotent
+    out = s.acquire_step("gpu", "w")
+    assert out["state"] == "acquired" and out["reattached"]
+    s.close()
+
+
+def test_detach_ends_the_clients_own_long_poll_without_reviving_the_ticket(store):
+    """SIGTERM: the client detaches while its long-poll is still open on the server. The detach wakes
+    that poll; it must not re-attach the ticket it was polling for (only a new request does)."""
+    store.acquire_step("gpu", "a")
+    t = store.acquire_step("gpu", "b")["ticket"]
+    out = {}
+    th = threading.Thread(target=lambda: out.update(res=store.acquire("gpu", "b", ticket=t, wait_s=5)))
+    th.start()
+    time.sleep(0.3)
+    store.detach("gpu", t, "b")
+    th.join(3)
+    assert out["res"]["state"] == "waiting" and out["res"]["dormant"]
+    assert [d["ticket"] for d in store.status("gpu")["dormant"]] == [t]
+    assert "ticket_reattached" not in kinds(store)

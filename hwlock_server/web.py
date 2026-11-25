@@ -5,11 +5,14 @@ Routes (JSON in/out; all except /health need `Authorization: Bearer $HWLOCK_TOKE
   GET  /                                       auto-refreshing HTML status page (token via ?token=...)
   GET  /status[?resource=R]  or /status/R      holders, leases, queues
   GET  /events[?resource=R&after=ID&limit=N]   audit log
-  POST /r/<resource>/acquire        {owner, reason?, host?, pid?, lease?, max_hold?, ticket?, wait?}
+  POST /r/<resource>/acquire        {owner, reason?, host?, pid?, lease?, max_hold?, ticket?, new_ticket?, wait?}
          200 acquired | 202 waiting (long-polls up to `wait` s, capped by the server) | 410 ticket gone
+         (without `ticket`, re-attaches to the owner's dormant or waiting ticket: "reattached": true)
   POST /r/<resource>/renew          {owner, lease?}           200 | 409 not_holder / over_max_hold
   POST /r/<resource>/release        {owner}                   200 | 409 not holder
   POST /r/<resource>/cancel         {ticket, owner?}          200 (also releases if that ticket was granted)
+  POST /r/<resource>/detach         {ticket?, owner?}         200 ticket dormant (keeps its place for the
+                                                              re-attach window; releases if it was granted)
   POST /r/<resource>/force-release  {by, reason?}             200 | 409 not held  (admin; logged)
 """
 
@@ -56,6 +59,10 @@ class Config:
                 *self.resource_hold_grace_s.values()]) < 0:
             raise ValueError("max hold and grace must be >= 0 (max hold 0 = no starvation guard)")
         self.sweep_s = float(kw.get("sweep_s") or env("HWLOCK_SWEEP_S", "1"))
+        # how long a waiter that hung up (killed, tool timeout, SIGTERM) keeps its place; 0 = drop at once
+        self.reattach_s = float(kw["reattach_s"] if "reattach_s" in kw else env("HWLOCK_REATTACH_S") or "120")
+        if not self.reattach_s >= 0:
+            raise ValueError("HWLOCK_REATTACH_S must be >= 0 (0 = drop a hung-up waiter's ticket at once)")
         if self.heartbeat_s < self.poll_s + 5:
             raise ValueError("HWLOCK_HEARTBEAT_S must be at least HWLOCK_POLL_S + 5 so a long-polling"
                              " waiter is never dropped")
@@ -143,7 +150,11 @@ def render_html(status: dict, token_qs: str) -> str:
         queue = "".join(
             f"<li>{q['position']}. <b>{e(q['owner'])}</b> {e(q['reason'] or '')}"
             f" <small>waiting {_fmt_s(q['waiting_s'])} · ticket {q['ticket']}</small></li>"
-            for q in r["queue"]) or "<li class=muted>empty</li>"
+            for q in r["queue"]) or ("" if r.get("dormant") else "<li class=muted>empty</li>")
+        queue += "".join(
+            f"<li class=muted>dormant: <b>{e(d['owner'])}</b> {e(d['reason'] or '')} <small>ticket"
+            f" {d['ticket']} · re-attach within {_fmt_s(max(0, d['dormant_left_s']))} to get place"
+            f" {d['position_on_reattach']} back</small></li>" for d in r.get("dormant", []))
         rows.append(f"<tr><td><b>{e(r['resource'])}</b></td><td>{holder}</td><td><ol>{queue}</ol></td></tr>")
     body = "".join(rows) or "<tr><td colspan=3 class=muted>no resources yet</td></tr>"
     return f"""<!doctype html><html lang=en><head><meta charset=utf-8>
@@ -248,7 +259,7 @@ class Handler(BaseHTTPRequestHandler):
                     sock = self.connection
                     out = store.acquire(res, b.get("owner"), reason=b.get("reason"), host=b.get("host"),
                                         pid=b.get("pid"), lease_s=b.get("lease"), ticket=b.get("ticket"),
-                                        max_hold_s=b.get("max_hold"),
+                                        max_hold_s=b.get("max_hold"), new_ticket=b.get("new_ticket", False),
                                         wait_s=wait, may_grant=lambda: _peer_alive(sock))
                     if out["state"] == "abandoned":
                         self.close_connection = True
@@ -260,6 +271,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, store.release(res, b.get("owner")))
                 if op == "cancel":
                     return self._send(200, store.cancel(res, b.get("ticket"), b.get("owner")))
+                if op == "detach":
+                    return self._send(200, store.detach(res, b.get("ticket"), b.get("owner")))
                 if op == "force-release":
                     return self._send(200, store.force_release(res, b.get("by"), b.get("reason")))
             return self._send(404, {"error": "not_found", "message": f"no route {method} {url.path}"})
@@ -285,7 +298,7 @@ class App:
         self.store = Store(cfg.db, default_lease_s=cfg.default_lease_s, max_lease_s=cfg.max_lease_s,
                            heartbeat_s=cfg.heartbeat_s, max_hold_s=cfg.max_hold_s,
                            hold_grace_s=cfg.hold_grace_s, resource_max_hold_s=cfg.resource_max_hold_s,
-                           resource_hold_grace_s=cfg.resource_hold_grace_s,
+                           resource_hold_grace_s=cfg.resource_hold_grace_s, reattach_s=cfg.reattach_s,
                            log=lambda m: print(f"hwlock: {m}", flush=True))
         self.httpd = Server((cfg.host, cfg.port), Handler)
         self.httpd.app = self  # type: ignore[attr-defined]
@@ -303,6 +316,7 @@ class App:
         print(f"hwlock {__version__} listening on http://{self.cfg.host}:{self.httpd.server_address[1]}"
               f" db={self.cfg.db} auth={'token' if self.cfg.token else 'none'}"
               f" max_hold={self.cfg.max_hold_s:g}s grace={self.cfg.hold_grace_s:g}s"
+              f" reattach={self.cfg.reattach_s:g}s"
               + "".join(f" {k}:max_hold={v:g}s" for k, v in self.cfg.resource_max_hold_s.items())
               + "".join(f" {k}:grace={v:g}s" for k, v in self.cfg.resource_hold_grace_s.items()), flush=True)
         try:

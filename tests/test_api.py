@@ -315,3 +315,42 @@ def test_guard_config_parsing():
             Config(resource_max_hold_s=bad)
     with pytest.raises(ValueError):
         Config(max_hold_s=-1)
+
+
+def test_dormant_ticket_is_dropped_after_the_reattach_window(make_server):
+    srv = make_server(HWLOCK_REATTACH_S="2")
+    api = srv.api
+    api.acquire("jetson", "holder")
+    t = api.acquire("jetson", "w", wait=0)[1]["ticket"]
+    assert api.post("/r/jetson/detach", {"ticket": t, "owner": "w"}) == (200, {
+        "state": "dormant", "resource": "jetson", "ticket": t, "window_s": 2.0})
+    st = api.status("jetson")
+    assert st["queue"] == [] and [d["ticket"] for d in st["dormant"]] == [t]
+    page = api.get("/")[1]
+    assert "dormant: <b>w</b>" in page and f"ticket {t}" in page
+    wait_for(lambda: api.status("jetson")["dormant"] == [], timeout=6)
+    assert [(e["owner"], e["ticket"]) for e in api.events("jetson", {"ticket_dropped"})] == [("w", t)]
+    assert api.acquire("jetson", "w", ticket=t, wait=0)[0] == 410
+    st, out = api.acquire("jetson", "w", wait=0)  # too late: a fresh ticket at the back
+    assert st == 202 and out["ticket"] > t and not out.get("reattached")
+
+
+def test_restart_keeps_dormant_tickets_with_their_remaining_window(make_server):
+    srv = make_server(HWLOCK_REATTACH_S="30")
+    api = srv.api
+    api.acquire("jetson", "holder")
+    t1 = api.acquire("jetson", "early", wait=0)[1]["ticket"]
+    api.post("/r/jetson/detach", {"ticket": t1, "owner": "early"})
+    t2 = api.acquire("jetson", "late", wait=0)[1]["ticket"]
+    left = api.status("jetson")["dormant"][0]["dormant_left_s"]
+    srv.kill()
+    time.sleep(2)
+    srv.start()
+    st = api.status("jetson")
+    assert [d["ticket"] for d in st["dormant"]] == [t1]
+    assert left - 6 < st["dormant"][0]["dormant_left_s"] < left - 1.5  # the window kept counting, not reset
+    assert [q["ticket"] for q in st["queue"]] == [t2]
+    st, out = api.acquire("jetson", "early", wait=0)  # re-attach by owner: its old place, before late
+    assert st == 202 and out["ticket"] == t1 and out["position"] == 1 and out["reattached"]
+    api.post("/r/jetson/release", {"owner": "holder"})
+    assert api.acquire("jetson", "early", ticket=t1, wait=0)[0] == 200
