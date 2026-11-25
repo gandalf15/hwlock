@@ -672,7 +672,8 @@ def test_old_database_gets_the_dormant_columns(tmp_path, clock):
 
     path = str(tmp_path / "old2.db")
     db = sqlite3.connect(path)
-    db.executescript(core.SCHEMA.replace(",\n    dormant_until REAL", "").replace(",\n    live_since REAL", ""))
+    db.executescript(core.SCHEMA.replace(",\n    dormant_until REAL", "").replace(",\n    live_since REAL", "")
+                     .replace(",\n    attach    TEXT", "").replace(",\n    holder_attach TEXT", ""))
     db.execute("INSERT INTO resources(name, created) VALUES ('gpu', ?)", (clock() - 9,))
     db.execute("INSERT INTO tickets(resource, owner, created, last_seen) VALUES ('gpu', 'w', ?, ?)",
                (clock() - 5, clock()))
@@ -684,8 +685,11 @@ def test_old_database_gets_the_dormant_columns(tmp_path, clock):
     assert [x["owner"] for x in q] == ["w"] and q[0]["waiting_s"] == 5
     s.close()
     s = Store(path, clock=clock)  # idempotent
-    out = s.acquire_step("gpu", "w")
+    assert {"dormant_until", "live_since", "attach"} <= {r[1] for r in s.db.execute("PRAGMA table_info(tickets)")}
+    assert "holder_attach" in {r[1] for r in s.db.execute("PRAGMA table_info(resources)")}
+    out = s.acquire_step("gpu", "w", attach="p1")
     assert out["state"] == "acquired" and out["reattached"]
+    assert s.cancel("gpu", out["ticket"], "w", attach="p0")["state"] == "superseded"
     s.close()
 
 
@@ -703,3 +707,70 @@ def test_detach_ends_the_clients_own_long_poll_without_reviving_the_ticket(store
     assert out["res"]["state"] == "waiting" and out["res"]["dormant"]
     assert [d["ticket"] for d in store.status("gpu")["dormant"]] == [t]
     assert "ticket_reattached" not in kinds(store)
+
+
+# ---------------------------------------------------------------- stale clients of a re-attached ticket
+# A killed client and its re-run share owner and ticket id. Each client process sends its own `attach`
+# id; only the latest client of a ticket (or of a grant) may detach, cancel or abandon it, so a late
+# request from the old process can never undo what the re-run has.
+
+def test_stale_detach_of_the_killed_client_cannot_release_the_reruns_grant(store):
+    store.acquire_step("gpu", "h")
+    t = store.acquire_step("gpu", "o", attach="old")["ticket"]
+    again = store.acquire_step("gpu", "o", attach="new")  # re-run while the old detach is still in flight
+    assert again["ticket"] == t and again["reattached"]
+    store.release("gpu", "h")
+    assert store.acquire_step("gpu", "o", ticket=t, attach="new")["state"] == "acquired"
+    out = store.detach("gpu", t, "o", attach="old")  # the old process's late detach lands now
+    assert out["state"] == "superseded"
+    assert store.status("gpu")["holder"]["owner"] == "o"  # still held: no second holder can be granted
+    assert store.acquire_step("gpu", "x")["state"] == "waiting"
+    # the current client's own detach (SIGTERM racing its grant) still releases
+    assert store.detach("gpu", t, "o", attach="new")["state"] == "released"
+
+
+def test_stale_detach_or_cancel_cannot_touch_the_reruns_live_ticket(store):
+    store.acquire_step("gpu", "h")
+    t = store.acquire_step("gpu", "o", attach="old")["ticket"]
+    store.acquire_step("gpu", "o", attach="new")
+    assert store.detach("gpu", t, "o", attach="old")["state"] == "superseded"
+    assert store.detach("gpu", None, "o", attach="old")["state"] == "superseded"
+    assert store.cancel("gpu", t, "o", attach="old")["state"] == "superseded"
+    st = store.status("gpu")
+    assert [q["ticket"] for q in st["queue"]] == [t] and st["dormant"] == []
+    assert store.cancel("gpu", t, "o", attach="new")["state"] == "cancelled"
+
+
+def test_stale_cancel_cannot_release_the_holders_reacquire_from_a_new_process(store):
+    t = store.acquire_step("gpu", "o", attach="old")["ticket"]  # granted as the old client was killed
+    assert store.acquire_step("gpu", "o", attach="new")["reacquired"]  # the re-run: holder re-acquire
+    assert store.cancel("gpu", t, "o", attach="old")["state"] == "superseded"
+    assert store.detach("gpu", t, "o", attach="old")["state"] == "superseded"
+    assert store.status("gpu")["holder"]["owner"] == "o"
+
+
+def test_old_connection_hanging_up_does_not_put_the_reruns_ticket_to_sleep(store):
+    store.acquire_step("gpu", "h")
+    t = store.acquire_step("gpu", "o", attach="old")["ticket"]
+    alive = {"old": True}
+    out = {}
+    th = threading.Thread(target=lambda: out.update(res=store.acquire(
+        "gpu", "o", ticket=t, attach="old", wait_s=5, may_grant=lambda: alive["old"])))
+    th.start()
+    time.sleep(0.2)
+    store.acquire_step("gpu", "o", attach="new")  # re-run attaches before the server saw the hang-up
+    alive["old"] = False  # now the old connection is noticed as closed
+    th.join(4)
+    assert out["res"]["state"] == "abandoned"
+    st = store.status("gpu")
+    assert [q["ticket"] for q in st["queue"]] == [t] and st["dormant"] == []
+    assert "ticket_dormant" not in kinds(store)
+
+
+def test_requests_without_attach_id_keep_the_old_behaviour(store):
+    store.acquire_step("gpu", "h")
+    t = store.acquire_step("gpu", "o", attach="old")["ticket"]
+    store.acquire_step("gpu", "o")  # an old client (no attach id) re-attaches: it cannot be told apart
+    assert store.detach("gpu", t, "o", attach="old")["state"] == "dormant"
+    assert store.acquire_step("gpu", "o", ticket=t)["reattached"]
+    assert store.detach("gpu", t, "o")["state"] == "dormant"  # an old client's detach: no id, acts

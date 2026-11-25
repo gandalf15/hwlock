@@ -354,3 +354,23 @@ def test_restart_keeps_dormant_tickets_with_their_remaining_window(make_server):
     assert st == 202 and out["ticket"] == t1 and out["position"] == 1 and out["reattached"]
     api.post("/r/jetson/release", {"owner": "holder"})
     assert api.acquire("jetson", "early", ticket=t1, wait=0)[0] == 200
+
+
+def test_late_detach_or_cancel_of_a_replaced_client_is_superseded(api):
+    """Over HTTP: a killed client's late detach/cancel (its own `attach` id) cannot release what the
+    re-run of the same acquire (a newer `attach` id) has been granted."""
+    assert api.acquire("jetson", "h")[0] == 200
+    st, out = api.acquire("jetson", "o", attach="old1")
+    t = out["ticket"]
+    st, out = api.acquire("jetson", "o", attach="new1")
+    assert st == 202 and out["ticket"] == t and out["reattached"]
+    api.post("/r/jetson/release", {"owner": "h"})
+    assert api.acquire("jetson", "o", ticket=t, attach="new1")[0] == 200
+    for op in ("detach", "cancel"):
+        st, out = api.post(f"/r/jetson/{op}", {"ticket": t, "owner": "o", "attach": "old1"})
+        assert st == 200 and out["state"] == "superseded", out
+    assert api.status("jetson")["holder"]["owner"] == "o"
+    st, out = api.post("/r/jetson/detach", {"ticket": t, "owner": "o", "attach": "bad id!"})
+    assert st == 400
+    st, out = api.post("/r/jetson/cancel", {"ticket": t, "owner": "o", "attach": "new1"})
+    assert out["state"] == "released" and api.status("jetson")["free"]

@@ -5,14 +5,17 @@ Routes (JSON in/out; all except /health need `Authorization: Bearer $HWLOCK_TOKE
   GET  /                                       auto-refreshing HTML status page (token via ?token=...)
   GET  /status[?resource=R]  or /status/R      holders, leases, queues
   GET  /events[?resource=R&after=ID&limit=N]   audit log
-  POST /r/<resource>/acquire        {owner, reason?, host?, pid?, lease?, max_hold?, ticket?, new_ticket?, wait?}
+  POST /r/<resource>/acquire        {owner, reason?, host?, pid?, lease?, max_hold?, ticket?, new_ticket?,
+                                     attach?, wait?}
          200 acquired | 202 waiting (long-polls up to `wait` s, capped by the server) | 410 ticket gone
          (without `ticket`, re-attaches to the owner's dormant or waiting ticket: "reattached": true)
   POST /r/<resource>/renew          {owner, lease?}           200 | 409 not_holder / over_max_hold
   POST /r/<resource>/release        {owner}                   200 | 409 not holder
-  POST /r/<resource>/cancel         {ticket, owner?}          200 (also releases if that ticket was granted)
-  POST /r/<resource>/detach         {ticket?, owner?}         200 ticket dormant (keeps its place for the
+  POST /r/<resource>/cancel         {ticket, owner?, attach?} 200 (also releases if that ticket was granted)
+  POST /r/<resource>/detach         {ticket?, owner?, attach?} 200 ticket dormant (keeps its place for the
                                                               re-attach window; releases if it was granted)
+  `attach`: an id each client process picks once; when given, a cancel/detach acts only if it comes from
+  the ticket's (or grant's) latest client, else 200 {"state": "superseded"} (a re-run replaced it).
   POST /r/<resource>/force-release  {by, reason?}             200 | 409 not held  (admin; logged)
 """
 
@@ -260,7 +263,7 @@ class Handler(BaseHTTPRequestHandler):
                     out = store.acquire(res, b.get("owner"), reason=b.get("reason"), host=b.get("host"),
                                         pid=b.get("pid"), lease_s=b.get("lease"), ticket=b.get("ticket"),
                                         max_hold_s=b.get("max_hold"), new_ticket=b.get("new_ticket", False),
-                                        wait_s=wait, may_grant=lambda: _peer_alive(sock))
+                                        attach=b.get("attach"), wait_s=wait, may_grant=lambda: _peer_alive(sock))
                     if out["state"] == "abandoned":
                         self.close_connection = True
                         return None
@@ -270,9 +273,9 @@ class Handler(BaseHTTPRequestHandler):
                 if op == "release":
                     return self._send(200, store.release(res, b.get("owner")))
                 if op == "cancel":
-                    return self._send(200, store.cancel(res, b.get("ticket"), b.get("owner")))
+                    return self._send(200, store.cancel(res, b.get("ticket"), b.get("owner"), b.get("attach")))
                 if op == "detach":
-                    return self._send(200, store.detach(res, b.get("ticket"), b.get("owner")))
+                    return self._send(200, store.detach(res, b.get("ticket"), b.get("owner"), b.get("attach")))
                 if op == "force-release":
                     return self._send(200, store.force_release(res, b.get("by"), b.get("reason")))
             return self._send(404, {"error": "not_found", "message": f"no route {method} {url.path}"})
