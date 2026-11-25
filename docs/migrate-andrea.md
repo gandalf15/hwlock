@@ -34,9 +34,13 @@ Replace the whole file with this text, and keep the file executable:
 # HWLOCK_RESOURCE_MAX_HOLD_S=jetson=7200). JETSON_LOCK_MAX_HOLD_S, if set, asks for a shorter limit for this
 # hold (--max-hold; the server caps it); JETSON_LOCK_GRACE_S is server-side only and ignored here.
 # JETSON_LOCK_KILL_ON_PREEMPT=1: `run` stops the ssh command when the max hold is hit (else it warns).
+# Health (if the hwlock server probes the Jetson): nobody is granted it while it is down. JETSON_LOCK_FAIL_IF_DOWN=1:
+# acquire/run give up at once when it is down (exit 6) instead of waiting. `run` stops the ssh command when the
+# Jetson goes down (6) or reboots (7). `jetson-lock watch [--until up]` blocks until its next health change.
 # Exit codes: as `hwlock` (0 ok, 1 not holder, 2 usage, 3 gave up after max-wait, 4 server problem,
-# 5 OVER_MAX_HOLD, 130 Ctrl-C while waiting (ticket cancelled), 143 SIGTERM while waiting (ticket kept: re-run
-# the same acquire within 120 s to keep the place); run: the remote command's code).
+# 5 OVER_MAX_HOLD, 6 Jetson DOWN, 7 Jetson REBOOTED (lease voided), 8 DEGRADED (watch), 130 Ctrl-C while waiting
+# (ticket cancelled), 143 SIGTERM while waiting (ticket kept: re-run the same acquire within 120 s to keep the
+# place); run: the remote command's code).
 set -euo pipefail
 HOST=${JETSON_HOST:-marcel@192.168.0.99}
 RES=${JETSON_LOCK_RESOURCE:-jetson}
@@ -49,6 +53,7 @@ lease=(); wait=(); hold=(); kill=()
 [[ ${JETSON_LOCK_MAX_WAIT_S:-0} != 0 ]] && wait=(--max-wait "$JETSON_LOCK_MAX_WAIT_S")
 [[ ${JETSON_LOCK_MAX_HOLD_S:-0} != 0 ]] && hold=(--max-hold "$JETSON_LOCK_MAX_HOLD_S")
 [[ ${JETSON_LOCK_KILL_ON_PREEMPT:-0} != 0 ]] && kill=(--kill-on-preempt)
+[[ ${JETSON_LOCK_FAIL_IF_DOWN:-0} != 0 ]] && wait+=(--fail-if-down)
 
 cmd=${1:-}; shift || true
 case $cmd in
@@ -58,6 +63,7 @@ acquire)
 renew)   exec "$HWLOCK" renew "$RES" "${1:?usage: jetson-lock renew <owner>}" ${lease[@]+"${lease[@]}"} ;;
 release) exec "$HWLOCK" release "$RES" "${1:?usage: jetson-lock release <owner>}" ;;
 status)  exec "$HWLOCK" status "$RES" ;;
+watch)   exec "$HWLOCK" watch "$RES" "$@" ;;
 run)
     owner=${1:?usage: jetson-lock run <owner> [reason] -- <command>}; shift; reason=()
     [[ ${1:-} != -- ]] && { reason=("$1"); shift; }
@@ -66,7 +72,7 @@ run)
     # shellcheck disable=SC2086  # $SSH is a command line on purpose
     exec "$HWLOCK" run "$RES" "$owner" ${reason[@]+"${reason[@]}"} ${lease[@]+"${lease[@]}"} \
         ${wait[@]+"${wait[@]}"} ${hold[@]+"${hold[@]}"} ${kill[@]+"${kill[@]}"} -- $SSH "$HOST" "$@" ;;
-*) sed -n '2,22p' "$0"; exit 2 ;;
+*) sed -n '2,25p' "$0"; exit 2 ;;
 esac
 ```
 
@@ -194,3 +200,50 @@ Then:
 - **CLAUDE.md.** The rule text can stay as it is, because the verbs are unchanged. Optionally add one line: "`scripts/jetson-lock status` / http://127.0.0.1:8770/ show holder and queue; `~/code/hwlock/client/hwlock events jetson` shows the history."
 - **Old fence.** After a day, check `~/.cache/jetson-lock.legacy status`. It should show only the `migration-to-hwlock` holder and nothing in the queue. If so, release it (`~/.cache/jetson-lock.legacy release migration-to-hwlock`) and remove `~/.jetson-lock` on the Jetson. If an old-style waiter is still queued behind the fence, it is a stale process that was started before the switch. Stop it, or let its owner know.
 - **Rollback.** `git revert` the swap commit and release the fence. All the old state is still in `~/.jetson-lock` on the Jetson.
+
+## 4. Jetson health: being told when the board dies
+
+On 2026-11-25 the Jetson ran out of memory and froze for over 30 minutes (ssh accepted TCP but never answered) until it
+was rebooted by hand. Jobs waited on a dead board and nobody was told. hwlock now probes it; see
+[Hardware health](../README.md#hardware-health) in the README. This works with the old lock too: health is a feature of
+the hwlock server, and `hwlock watch jetson` needs no hwlock lock.
+
+**In place (done):**
+- `hwlock-exporter` runs on the Jetson as the systemd `--user` unit `hwlock-exporter` (port 8771, read-only JSON:
+  boot id, memory, load, temperatures, GPU load, power mode). The GNOME autologin (`AutomaticLogin=marcel`) starts the
+  user manager at boot, like `andrea-docker`, so the exporter is back after a reboot without lingering. It runs next to
+  Andrea and loads nothing; it uses about 15 MB.
+  Reinstall or remove it from the PC, under the Jetson lock: `exporter/install.sh --ssh marcel@192.168.0.99`,
+  `exporter/uninstall.sh --ssh marcel@192.168.0.99`.
+- The live server probes resource `jetson` with `config/health.json` (gitignored; `.env` has
+  `HWLOCK_HEALTH_CONFIG=/config/health.json`):
+
+  ```json
+  {"resources": {"jetson": {"interval_s": 5, "down_after": 3, "up_after": 2, "degraded_after": 2, "probes": [
+    {"type": "ssh_banner", "host": "192.168.0.99", "port": 22, "timeout_s": 3},
+    {"type": "http_json", "url": "http://192.168.0.99:8771/", "timeout_s": 3,
+     "degraded_if": {"mem_available_mb": "<800", "temp_max_c": ">85"}}]}}}
+  ```
+
+  A freeze like the one on 2026-11-25 (TCP accepted, no ssh banner) is `down` within about 15 to 20 s. Memory below
+  800 MB available is `degraded`. A new boot id is `rebooted`: the lease of whoever held the Jetson before the reboot is
+  voided, and the queue keeps its order.
+
+**What agents see** (after the switch in section 3, through `scripts/jetson-lock`, which passes the codes on):
+- A waiting `acquire` prints `WARNING: jetson is DOWN (...)` at once and keeps waiting, because nobody is granted a
+  dead board. `JETSON_LOCK_FAIL_IF_DOWN=1` makes it exit 6 instead.
+- `scripts/jetson-lock run` stops the ssh command and exits 6 when the Jetson goes down, or 7 when it rebooted.
+- `scripts/jetson-lock watch` (or `~/code/hwlock/client/hwlock watch jetson`) blocks until the next health change and
+  exits 0 (up), 6 (down), 7 (rebooted) or 8 (degraded). `watch --until up` waits for a dead board to come back.
+
+**CLAUDE.md lines to add** (with the switch, or now for `watch` alone):
+
+```markdown
+- Start `scripts/jetson-lock acquire` (and `hwlock watch jetson` if you want to hear when the Jetson dies) as a
+  BACKGROUND command and keep working; you are notified when it exits. Never loop, sleep or grep over its output.
+- Exit 6 = Jetson DOWN: stop, report it to the user with the printed reason, do not retry blindly.
+  7 = REBOOTED, your lease was voided: re-acquire, re-check what you set up on the Jetson (deployed files,
+  andrea-docker, loaded models), redo the interrupted step. 8 = DEGRADED (low memory): no model loads, report.
+```
+
+The bash fallback client (`client/hwlock.sh`) does not act on health; the wrapper uses the Python client.

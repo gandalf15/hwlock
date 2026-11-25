@@ -3,6 +3,8 @@
 hwlock makes AI subagents and humans take turns on shared hardware: a Jetson, a GPU box, a robot or a test rig.
 
 Each named resource has one holder, a first-in-first-out (FIFO) queue of waiters, and leases that expire on their own.
+Optionally, the server also watches each device's [health](#hardware-health) (alive, low on memory, rebooted), stops
+handing out a dead device, and tells waiting and holding clients at once.
 
 - **Server:** one small process (Python standard library and SQLite in WAL mode) that runs in Docker.
 - **Client:** a single file, `client/hwlock`, that runs on any Python from 3.8 up. It has no dependencies, so it also runs on a Jetson.
@@ -33,12 +35,14 @@ Open <http://127.0.0.1:8770/> for a status page that refreshes every 3 s.
 ## Client reference
 
 ```text
-hwlock acquire <resource> <owner> [reason] [--lease S] [--max-wait S] [--max-hold S] [--new-ticket]
+hwlock acquire <resource> <owner> [reason] [--lease S] [--max-wait S] [--max-hold S] [--new-ticket] [--fail-if-down] [--exit-on-degraded]
 hwlock renew   <resource> <owner> [--lease S]
 hwlock release <resource> <owner>
 hwlock status  [resource] [--json]
-hwlock run     <resource> <owner> [reason] [--lease S] [--max-wait S] [--max-hold S] [--new-ticket] [--kill-on-preempt] -- <cmd...>
-hwlock hold    <resource> <owner> [reason] --until-file F [--lease S] [--max-wait S] [--max-hold S] [--new-ticket]
+hwlock run     <resource> <owner> [reason] [--lease S] [--max-wait S] [--max-hold S] [--new-ticket] [--kill-on-preempt]
+               [--on-down kill|warn] [--fail-if-down] [--exit-on-degraded] -- <cmd...>
+hwlock hold    <resource> <owner> [reason] --until-file F [--lease S] [--max-wait S] [--max-hold S] [--new-ticket] [--fail-if-down] [--exit-on-degraded]
+hwlock watch   <resource> [--until up|down|degraded|rebooted] [--timeout S] [--json]
 hwlock events  [resource] [--limit N] [--json]
 hwlock force-release <resource> <by> [reason]      # admin, logged
 ```
@@ -51,9 +55,12 @@ hwlock force-release <resource> <by> [reason]      # admin, logged
 | 3 | Gave up after `--max-wait`. The ticket was withdrawn. |
 | 4 | The server is unreachable, or it rejected the request: wrong token or invalid input. |
 | 5 | `OVER_MAX_HOLD`: the [starvation guard](#starvation-guard) refused `renew` or a re-`acquire`, because you have held the resource past its max hold while others wait. `renew` prints `OVER_MAX_HOLD waiting=N evict_in=S`. `hold` exits 5 once it lost the lock that way, and `run --kill-on-preempt` exits 5 after stopping the command. |
+| 6 | The device is **DOWN** (only for resources with [health probes](#hardware-health)): `acquire --fail-if-down` gave up (ticket withdrawn), `run` stopped the command, `hold` ended (lock released), `watch` saw it go down. |
+| 7 | The device **REBOOTED**: your lease was voided (`run` stopped the command, `hold` ended; `renew`/`release` print `VOIDED_REBOOT`), or `watch` saw a reboot. Whatever you set up on the device is gone. |
+| 8 | The device is **DEGRADED** (low memory, hot, exporter unreachable): only with `--exit-on-degraded`, or `watch` saw it. |
 | 130 | Ctrl-C (SIGINT) while waiting. The ticket was withdrawn: you gave up your place. |
 | 143 | SIGTERM while waiting, for example a tool timeout or `timeout`. The ticket was **kept**: it is dormant for the server's re-attach window (120 s), and re-running the same `acquire` within it gets your place back. See [Keeping your place](#keeping-your-place). |
-| `run` | The command's own exit code, or 128+N if the command was killed by signal N. 127 if it could not be started. |
+| `run` | The command's own exit code, or 128+N if the command was killed by signal N. 127 if it could not be started. 6/7/8 if it was stopped for the device's health. |
 
 ### Commands
 
@@ -74,6 +81,7 @@ hwlock force-release <resource> <by> [reason]      # admin, logged
   - A dormant ticket is skipped while dormant: the next connected waiter is served, and a free lock is never held up by it.
   - After the window it is dropped (`ticket_dropped` event), and the next `acquire` joins at the back.
   - Ctrl-C (SIGINT) still gives the place up (the ticket is cancelled, exit 130). `--new-ticket` drops any old ticket of this owner and joins at the back.
+- **`watch`** blocks until the next health change of a resource (or, with `--until STATE`, until it is in that state), prints it and exits with its code: 0 back up, 6 down, 7 rebooted, 8 degraded, 3 after `--timeout`. Agents start it as a background command: its exit is the notification. See [Hardware health](#hardware-health).
 - **`--max-hold S`** (`acquire`, `run`, `hold`) asks for a shorter max hold than the server's for this hold. The server caps it at its own limit, so you can lower it but not raise it.
 - **Owner names** match `[A-Za-z0-9._-]{1,64}`. Make each one unique per job, for example `quant-exp-3` or `ci-1234`. Renew and release are checked against the owner name, and so is re-attaching: two clients that wait at the same time with the same owner on one resource share one ticket. When it is granted, both get the lock (as a re-acquire by the holder would), and a Ctrl-C in either one cancels the shared ticket.
 
@@ -84,7 +92,7 @@ Environment variables:
 
 ### bash/curl fallback
 
-`client/hwlock.sh` covers `acquire`, `renew`, `release` and `status` with only bash and curl. Use it on machines that have no Python at all:
+`client/hwlock.sh` covers `acquire`, `renew`, `release` and `status` with only bash and curl. Use it on machines that have no Python at all. It does not act on health (no exit 6/7/8, no `watch`); while a device is down its `acquire` simply keeps waiting, since the server grants nothing then:
 
 ```bash
 HWLOCK_URL=http://pc:8770 client/hwlock.sh acquire jetson job-1 "deploy" 1800
@@ -128,20 +136,103 @@ curl -s -XPOST $HWLOCK_URL/r/jetson/release -d '{"owner":"job-1"}'              
   - `force-release` (admin) is logged with who did it and why.
   - Cancelling a ticket that was granted in the meantime releases the lock.
 
+## Hardware health
+
+A lock does not help when the device itself dies. On 2026-11-25 the 8 GB Jetson ran out of memory and froze for over
+30 minutes: ssh accepted the TCP connection but never answered. Jobs kept waiting for a dead board, the holder's work was
+lost when it was rebooted by hand, and nobody was told. So the server can probe each device and act on what it sees.
+
+**States** per resource: `up`, `degraded`, `down`, `unknown` (not decided yet), plus a `rebooted` event when the device's
+boot id changes.
+
+**Configuration**: a JSON file (JSON is also valid YAML) named by `HWLOCK_HEALTH_CONFIG`. In Docker, put it in
+`config/health.json` (gitignored; start from [`config/health.example.json`](config/health.example.json)) and set
+`HWLOCK_HEALTH_CONFIG=/config/health.json` in `.env`; compose mounts `HWLOCK_CONFIG_DIR` (default `./config`) read-only at
+`/config`. A broken file stops the server at startup, with the reason in its log. Resources without probes behave as before.
+
+```json
+{"resources": {"jetson": {
+  "interval_s": 5, "down_after": 3, "up_after": 2, "degraded_after": 2,
+  "probes": [
+    {"type": "ssh_banner", "host": "192.168.0.99", "port": 22, "timeout_s": 3},
+    {"type": "http_json", "url": "http://192.168.0.99:8771/", "timeout_s": 3,
+     "degraded_if": {"mem_available_mb": "<800", "temp_max_c": ">85"}}]}}}
+```
+
+| Probe | Passes when | On failure (`on_fail` default) |
+|---|---|---|
+| `ssh_banner` `host`, `port` (22) | TCP connects **and** the `SSH-` banner arrives within `timeout_s`. A frozen box accepts TCP in its kernel but sshd never speaks: a plain TCP check would call it alive. | `down` |
+| `tcp` `host`, `port` | TCP connects. | `down` |
+| `http_json` `url` | `GET` answers 200 with a JSON object within `timeout_s` (one deadline for the whole exchange). Reads `boot_id` and `uptime_s` (keys: `boot_id_key`, `uptime_key`) and checks `degraded_if` thresholds (`<`, `<=`, `>`, `>=`; dotted keys for nested values). | `degraded` (the box answers ssh but its exporter does not) |
+| `command` `argv` (list) or `cmd` (shell) | Exit 0 within `timeout_s`. Runs **in the server's container**. | `down` |
+
+Every `interval_s` (5 s) all probes of a resource run in parallel. A round is `down` if a probe with `on_fail: down`
+failed, `degraded` if one with `on_fail: degraded` failed or a threshold was crossed, `up` otherwise. The state changes
+only after several rounds in a row (hysteresis): `down` after `down_after` (3) down rounds, back from `down` after
+`up_after` (2) rounds that are not down (to the latest round's level), `up` to `degraded` after `degraded_after` (2)
+degraded rounds, and back after `up_after` clean rounds. With the defaults a dead box is `down` within about 15 to 20 s.
+
+**What happens**
+- Every transition is an event (`health_up`, `health_degraded`, `health_down`), and the server ends every waiting
+  client's long-poll at once, so `acquire` prints the change right away (`WARNING: jetson is DOWN (for 12s): ssh_banner
+  192.168.0.99:22: TCP accepted but no SSH banner within 3 s (frozen?)`).
+- **While a device is down nobody is granted it.** The queue keeps its order and moves on when the device is back.
+  `acquire` keeps waiting and says so; `--fail-if-down` gives up instead (ticket withdrawn, exit 6). A holder keeps its
+  lock (and lease) while the device is down: `run` and `hold` end themselves (below).
+- **Reboot**: when an `http_json` probe reports a new `boot_id`, the server logs `rebooted` and voids the holder's
+  lease (`lease_voided_reboot`): its work on the device is gone. Only a lock taken before that boot is voided (one taken
+  after it, for example while the exporter was still starting, is kept). Waiters keep their tickets and FIFO order and
+  are told. The voided holder's `renew`/`release` answer 409 with `voided` (`VOIDED_REBOOT`, exit 7), not a plain
+  `NOT_HOLDER`. A reboot is only seen through a boot id: without an exporter, a quick reboot looks like a short outage.
+- **Holders** (`run`, `hold`) long-poll `GET /r/<res>/health` next to their renewals, so they learn at once:
+  - `run`: on down or reboot it stops the command (SIGTERM, SIGKILL 10 s later) and exits 6 or 7. `--on-down=warn` only
+    warns and returns the command's code. It releases the lock on exit (not needed after a reboot: the lease is void).
+  - `hold`: ends at once, exit 6 (lock released) or 7.
+- **Degraded** is a warning by default (the device works but is short of memory, hot, or its exporter is gone).
+  `--exit-on-degraded` (`acquire`, `run`, `hold`) treats it like down, with exit 8.
+- `renew` prints a warning when the device is down or degraded and still exits 0: the holder decides.
+- **Persistence**: the state, its start and the last boot id are stored in SQLite, so a server restart neither
+  forgets a down device (still no grants right after the restart) nor reports a false reboot, and a reboot that
+  happened while the server was down is still noticed. The latest metrics are kept in memory only.
+- `hwlock status`, `GET /status` and the page at `/` show each device's state, why, and its latest metrics (memory,
+  load, temperatures, GPU load, uptime, power mode) and last reboot. `GET /r/<res>/health` returns the same with the
+  probe results.
+
+### Exporter
+
+[`exporter/hwlock-exporter`](exporter/hwlock-exporter) is a tiny read-only HTTP endpoint for any Linux box: one Python
+file (3.7 or later, standard library only), no secrets, no writes, no commands run. `GET /` returns JSON:
+`boot_id` (`/proc/sys/kernel/random/boot_id`), `uptime_s`, `mem_total_mb`, `mem_available_mb`, `swap_*_mb`,
+`load1/5/15`, `ncpu`, `temps_c` (every `/sys/class/thermal` zone by type), `temp_max_c`, `cpu_temp_c`, `gpu_temp_c`,
+`gpu_load_pct` (Jetson: `/sys/devices/platform/**/…gpu/load`, per mille), `nvpmodel` (Jetson power mode, from
+`/var/lib/nvpmodel`), and `psi_mem_*_avg10` where the kernel has pressure stall information.
+
+```bash
+exporter/install.sh --ssh marcel@192.168.0.99            # or run exporter/install.sh on the box itself
+exporter/install.sh --ssh user@box --allow 192.168.0.0/24  # answer only the LAN (others get 403)
+exporter/uninstall.sh --ssh marcel@192.168.0.99
+```
+
+The installer puts it in `~/.local/bin`, writes the systemd `--user` unit `hwlock-exporter` (port 8771, all interfaces,
+`Restart=always`), starts it and checks it answers. A user unit runs while the user's systemd instance does: from boot
+with lingering (`loginctl enable-linger`) or a desktop autologin (the Jetson has one), otherwise only after a login.
+Check it with `curl http://<box>:8771/`, logs with `journalctl --user -u hwlock-exporter`.
+
 ## Server
 
 | Endpoint | Purpose |
 |---|---|
 | `GET /health` | Liveness check. It never needs a token. |
 | `GET /` | HTML status page that refreshes every 3 s. With a token set, open `/?token=…` (a browser cannot send a bearer header). |
-| `GET /status`, `GET /status/<resource>` | JSON: holder (owner, reason, host, pid, since, lease left), `queue` (live waiters) and `dormant` (tickets whose client is gone, with `dormant_left_s` and `position_on_reattach`). |
-| `GET /events?resource=&after=&limit=` | Audit log, with these event kinds: `create`, `enqueue`, `acquire`, `reacquire`, `renew`, `release`, `expire`, `drop`, `abandon`, `ticket_dormant`, `ticket_reattached`, `ticket_dropped`, `cancel`, `force_release`, `renew_refused`, `evict_max_hold`, `server_start`. |
+| `GET /status`, `GET /status/<resource>` | JSON: holder (owner, reason, host, pid, since, lease left), `queue` (live waiters), `dormant` (tickets whose client is gone, with `dormant_left_s` and `position_on_reattach`) and `health` (null without probes). Acquire and renew answers also carry `health` (without metrics). |
+| `GET /events?resource=&after=&limit=` | Audit log, with these event kinds: `create`, `enqueue`, `acquire`, `reacquire`, `renew`, `release`, `expire`, `drop`, `abandon`, `ticket_dormant`, `ticket_reattached`, `ticket_dropped`, `cancel`, `force_release`, `renew_refused`, `evict_max_hold`, `health_up`, `health_degraded`, `health_down`, `rebooted`, `lease_voided_reboot`, `server_start`. |
 | `POST /r/<res>/acquire` | Body `{owner, reason?, host?, pid?, lease?, max_hold?, ticket?, new_ticket?, attach?, wait?}`. Returns 200 acquired, 202 waiting or 410 ticket gone. Without `ticket` it re-attaches to the owner's dormant or waiting ticket (`"reattached": true`); `new_ticket: true` drops those and joins at the back. Also 409 `over_max_hold` when the holder re-acquires past its max hold while others wait. |
 | `POST /r/<res>/renew` | Body `{owner, lease?}`. Returns 200, 409 `not_holder`, or 409 `over_max_hold` with `{message, waiting, held_s, max_hold_s, grace_s, evict_at, evict_in_s, lease_left_s}`. |
 | `POST /r/<res>/release` | Body `{owner}`. Returns 200, or 409 not holder. |
 | `POST /r/<res>/cancel` | Body `{ticket, owner?, attach?}`. Gives the place up (also for a dormant ticket). With `attach`, only when it is the ticket's (or grant's) newest client; otherwise `"state": "superseded"` and nothing changes. |
 | `POST /r/<res>/detach` | Body `{ticket?, owner?, attach?}`. The client is leaving but keeps its place: the ticket turns dormant for the re-attach window. If that ticket was granted meanwhile, the lock is released. `attach` as for cancel. |
 | `POST /r/<res>/force-release` | Body `{by, reason?}`. Needs `HWLOCK_ADMIN_TOKEN` if that is set. |
+| `GET /r/<res>/health?after=SEQ&wait=S` | Health of a resource with probes (404 without): `{health: {state, since, for_s, reason, seq, boot_id, last_reboot, metrics, probes, checked_s_ago}, events, holder}`. With `after`, long-polls up to `wait` s (capped like acquire) until a health event newer than `seq` exists and lists those events. |
 
 Settings, all optional:
 
@@ -156,6 +247,7 @@ Settings, all optional:
 - `HWLOCK_HOLD_GRACE_S`: the grace period before an over-max holder is evicted, 300.
 - `HWLOCK_RESOURCE_MAX_HOLD_S`, `HWLOCK_RESOURCE_HOLD_GRACE_S`: per-resource values that override the two above, as `resource=seconds` pairs separated by commas, for example `jetson=7200,robot-arm=0`. The server logs the values it uses at startup.
 - `HWLOCK_SWEEP_S`: how often expired leases and dead tickets are checked, 1.
+- `HWLOCK_HEALTH_CONFIG`: the [health](#hardware-health) probe config (JSON file). Unset: no health checks.
 - `HWLOCK_DB`, `HWLOCK_HOST`, `HWLOCK_PORT`: where the database lives and where the server listens.
 
 ### Docker
@@ -192,6 +284,14 @@ Without Docker: `python3 -m hwlock_server --db ~/.local/share/hwlock.db` (Python
 - If you are told you lost the lock (lease expired), stop using the hardware and acquire again.
 - Never keep the lock for work that is not using the device (no idle `hold`, no blind renew loop). While others
   wait, a hold ends after 2 h: `OVER_MAX_HOLD` (exit 5) means finish the step, release, and queue again.
+- Waiting can take long: start `hwlock acquire ...` as a BACKGROUND command and keep working; you are notified when
+  it exits. Never loop, sleep or grep over its output file to see whether it is done. Same for
+  `hwlock watch <resource>` (exits at the next health change) if you want to hear when the device dies or comes back.
+- The device can die. Exit codes: 6 DOWN = stop, report it to the user with the printed reason, do not retry blindly
+  (`hwlock watch <resource> --until up` in the background tells you when it is back); 7 REBOOTED = your lease was
+  voided and whatever you started on the device is gone: re-acquire, re-check your setup (deployed files, running
+  services, loaded models) and redo the interrupted step; 8 DEGRADED (only with `--exit-on-degraded`) = low memory or
+  hot: do not start heavy work, report. `hwlock status` shows the reason and the latest metrics.
 ```
 
 ### Claude Code skill
@@ -207,7 +307,7 @@ Without Docker: `python3 -m hwlock_server --db ~/.local/share/hwlock.db` (Python
 ## Development
 
 ```bash
-make venv && make test   # unit, API, 50-client concurrency, CLI, shell clients, docker restart test
+make venv && make test   # unit, API, 50-client concurrency, CLI, shell clients, health, docker restart + sshd tests
 make test-fast           # no docker
 ```
 

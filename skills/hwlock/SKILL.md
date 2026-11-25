@@ -1,6 +1,6 @@
 ---
 name: hwlock
-description: Take turns on shared hardware (a Jetson, GPU box, robot, test rig) with other agents, subagents and humans through the hwlock service. Use before ANY use of a shared device - ssh commands, deploys, benchmarks, model loads, builds, flashing, live tests - and to see who is using it (hwlock status). Also use when a lock is lost, a lease must be renewed, or a job waits for hardware.
+description: Take turns on shared hardware (a Jetson, GPU box, robot, test rig) with other agents, subagents and humans through the hwlock service. Use before ANY use of a shared device - ssh commands, deploys, benchmarks, model loads, builds, flashing, live tests - and to see who is using it (hwlock status). Also use when a lock is lost, a lease must be renewed, a job waits for hardware, or a device is down, degraded or rebooted (exit 6/7/8, hwlock watch).
 ---
 
 # hwlock: one holder per device, FIFO queue, leases
@@ -39,11 +39,32 @@ measurements, run out of memory or break deploys. The `hwlock` service serialise
    `run` lets the command finish by default (check its results); add `--kill-on-preempt` for commands
    that must not touch the device once someone else has it.
 
-## Exit codes
-0 ok - 1 not the holder - 2 usage - 3 gave up (`--max-wait`) - 4 server unreachable/rejected
-(check `HWLOCK_URL`, `HWLOCK_TOKEN`) - 5 `OVER_MAX_HOLD` (renew refused / `hold` evicted /
-`run --kill-on-preempt` stopped the command) - 130 Ctrl-C while waiting (place given up) - 143 SIGTERM
-while waiting (place kept: re-run the same acquire) - `run`: the command's code.
+9. **Wait in the background, never poll.** An acquire can wait a long time. Start it as a BACKGROUND command
+   (your harness's background/`run_in_background` option) and go on with local work: you are notified when it
+   exits, and its exit code tells you what happened. Never loop, `sleep`, `tail` or `grep` over its output file to
+   see whether it is done. The same goes for `hwlock watch <resource>`, which blocks until the device's next
+   health change: start it in the background if you want to hear when the device dies or comes back.
+10. **The device can die.** The server probes it (ssh banner, exporter) and tells waiters and holders at once.
+   Nobody is granted a device that is down; `acquire` keeps waiting and prints the state (`--fail-if-down` to
+   give up instead). `run` stops the command when the device goes down or reboots; `hold` ends.
+
+## Exit codes and what to do
+| Code | Meaning | Do |
+|---|---|---|
+| 0 | ok | go on |
+| 1 | not the holder (lease expired) | stop touching the device, re-acquire, redo the suspect step |
+| 2 | usage | fix the command |
+| 3 | gave up after `--max-wait` (or `watch --timeout`) | report "device busy", decide with the user |
+| 4 | server unreachable/rejected | check `HWLOCK_URL`, `HWLOCK_TOKEN`; never use the device without the lock |
+| 5 | `OVER_MAX_HOLD` | finish the step within the grace, release, re-queue |
+| 6 | device **DOWN** (`--fail-if-down`, `run`/`hold` stopped, `watch`) | stop. Report it to the user with the printed reason. Do not retry blindly or try to "fix" the box over ssh. `hwlock watch <res> --until up` in the background tells you when it is back |
+| 7 | device **REBOOTED**: your lease was voided (`VOIDED_REBOOT`) | everything you set up on it is gone (deployed files in tmpfs, running services, loaded models, partial builds). Re-acquire, re-check your setup on the device, redo the interrupted step |
+| 8 | device **DEGRADED** (`--exit-on-degraded`, `watch`): low memory, hot, exporter gone | do not start heavy work (model loads, builds); report. Plain runs only warn |
+| 130 | Ctrl-C while waiting | place given up |
+| 143 | SIGTERM while waiting (tool timeout) | re-run the very same acquire within 2 min to keep your place |
+| `run` | the command's code (6/7/8 if stopped for health) | |
+
+`hwlock status` shows each device's health, why, and its latest metrics (free memory, load, temperatures, GPU).
 
 ## Setup (only if `hwlock` is not on PATH)
 The client is one stdlib-only Python file: `client/hwlock` from the hwlock repository. Server URL
