@@ -15,7 +15,7 @@ jobs:
       - name: tests (unit, API, concurrency, CLI, shell clients, docker restart)
         run: python -m pytest -q
   client-py38:
-    # the single-file client must run on old Pythons (Jetson images, old distros); runner images no
+    # the single-file client and the exporter must run on old Pythons (Jetson images, old distros); runner images no
     # longer ship 3.8, so take a standalone build from uv
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -25,5 +25,5 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install "pytest>=8" uv && uv python install 3.8
-      - name: CLI + concurrency tests with the client on Python 3.8
-        run: HWLOCK_CLIENT_PYTHON="$(uv python find 3.8)" python -m pytest -q tests/test_cli.py tests/test_concurrency.py tests/test_shell_clients.py
+      - name: CLI, concurrency and health tests with the client and the exporter on Python 3.8
+        run: HWLOCK_CLIENT_PYTHON="$(uv python find 3.8)" python -m pytest -q tests/test_cli.py tests/test_concurrency.py tests/test_shell_clients.py tests/test_health.py

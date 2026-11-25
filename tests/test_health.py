@@ -17,7 +17,7 @@ import urllib.request
 
 import pytest
 
-from conftest import (EXPORTER, exporter_resource, health_config, health_state, popen_client, run_client,
+from conftest import (CLIENT_PYTHON, EXPORTER, exporter_resource, health_config, health_state, popen_client, run_client,
                       wait_for)
 from hwlock_server import health as H
 
@@ -166,7 +166,7 @@ def test_config_errors_stop_the_server(tmp_path):
 # ---------------------------------------------------------------------------- exporter
 def test_exporter_reads_the_real_proc():
     """With its defaults the exporter reports this machine's real boot id and memory."""
-    out = subprocess.run([sys.executable, str(EXPORTER), "--once"], capture_output=True, text=True, timeout=20)
+    out = subprocess.run([CLIENT_PYTHON, str(EXPORTER), "--once"], capture_output=True, text=True, timeout=20)
     d = json.loads(out.stdout)
     assert d["boot_id"] == open("/proc/sys/kernel/random/boot_id").read().strip()
     assert 0 < d["mem_available_mb"] <= d["mem_total_mb"]

@@ -199,7 +199,7 @@ class ExporterProc:
 
     def start(self, *extra):
         self.proc_handle = subprocess.Popen(
-            [sys.executable, str(EXPORTER), "--bind", "127.0.0.1", "--port", str(self.port), "--proc", str(self.proc),
+            [CLIENT_PYTHON, str(EXPORTER), "--bind", "127.0.0.1", "--port", str(self.port), "--proc", str(self.proc),
              "--sys", str(self.sys), "--nvpmodel-dir", str(self.dir / "nvpmodel"), *extra],
             stdout=open(self.log, "a"), stderr=subprocess.STDOUT)
         deadline = time.time() + 10
