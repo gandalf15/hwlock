@@ -5,7 +5,7 @@ name: hwlock
 services:
   hwlock:
     build: .
-    image: hwlock:latest
+    image: ${HWLOCK_IMAGE:-hwlock:latest}
     restart: unless-stopped
     ports:
       - "${HWLOCK_BIND:-127.0.0.1}:${HWLOCK_PUBLISH_PORT:-8770}:8770"
