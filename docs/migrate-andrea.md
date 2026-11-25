@@ -1,6 +1,6 @@
 # Moving Andrea's `scripts/jetson-lock` to hwlock
 
-The current `andrea_ai/scripts/jetson-lock` keeps its state on the Jetson in `~/.jetson-lock/`. It uses ssh and atomic `mkdir`, and clients poll every 5 s. This guide replaces it with a thin wrapper around the hwlock service, using resource `jetson`. The verbs, arguments and environment variables stay the same, so agents and the CLAUDE.md rule need no retraining.
+The current `andrea_ai/scripts/jetson-lock` keeps its state on the Jetson in `~/.jetson-lock/`. It uses ssh and atomic `mkdir`, and its clients check the queue every 5 s over ssh. This guide replaces it with a thin wrapper around the hwlock service, using resource `jetson`. The verbs, arguments and environment variables stay the same, so agents and the CLAUDE.md rule need no retraining.
 
 **Do not do the switch while jobs are using the old lock.** Section 3 explains when and how.
 
@@ -80,7 +80,7 @@ esac
 
 - The verbs and arguments: `acquire <owner> [reason]`, `renew <owner>`, `release <owner>`, `status`, and `run <owner> [reason] -- <ssh command...>`.
   `run` still runs the command **on the Jetson over ssh** (`ssh -o BatchMode=yes -o ConnectTimeout=10 $JETSON_HOST ...`), and it still releases the lock when the command fails.
-- The variables `JETSON_HOST`, `JETSON_LOCK_LEASE_S` and `JETSON_LOCK_MAX_WAIT_S` (0 means wait forever). `JETSON_LOCK_POLL_S` is no longer used: clients long-poll instead.
+- The variables `JETSON_HOST`, `JETSON_LOCK_LEASE_S` and `JETSON_LOCK_MAX_WAIT_S` (0 means wait forever). `JETSON_LOCK_POLL_S` is no longer used: clients wait for the server's notification instead of checking every few seconds.
 - The owner format `[A-Za-z0-9._-]{1,64}`, the FIFO order, the 30-minute lease, and the 120 s window after which a waiting ticket that stopped refreshing is dropped.
 - **Keeping the place after a tool timeout** (andrea_ai commit 708fa93): an `acquire` killed with SIGTERM exits 143 and keeps its ticket; re-running `acquire` with the same owner within 120 s re-attaches to it and keeps its place. Ctrl-C exits 130 and cancels the ticket. The holder's own `acquire` returns at once. hwlock does this on the server: the killed waiter's ticket turns *dormant* (`ticket_dormant` event) for `HWLOCK_REATTACH_S` (default 120), and `status` lists it under the queue as `DORMANT`. One difference, an improvement: in the old script a killed waiter's ticket at the head of the queue still held up a free lock until its 120 s ran out; a dormant ticket is skipped, so the next live waiter goes at once and the dormant one comes next if it re-attaches in time. `--new-ticket` (hwlock client only) joins at the back on purpose.
 - `renew` and `release` print `NOT_HOLDER holder=<owner>` and exit 1 when you are not the holder. A successful `release` prints `RELEASED` and exits 0.

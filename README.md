@@ -12,7 +12,7 @@ handing out a dead device, and tells waiting and holding clients at once.
 
 ```text
 agent A ──acquire jetson──▶ ┌──────────────┐   holder: A (lease 30 min, renewable)
-agent B ──acquire jetson──▶ │ hwlock :8770 │   queue : B, C   (long-poll, FIFO)
+agent B ──acquire jetson──▶ │ hwlock :8770 │   queue : B, C   (FIFO, notified on change)
 human   ──status──────────▶ └──────────────┘   audit log, HTML page at /
 ```
 
@@ -65,7 +65,7 @@ hwlock force-release <resource> <by> [reason]      # admin, logged
 
 ### Commands
 
-- **`acquire`** takes a ticket. The first request returns at once with a ticket id. After that, the client waits by long-poll: the server holds each request for up to 25 s and answers early when the queue position or the holder changes. Nobody polls fast.
+- **`acquire`** takes a ticket. The first request returns at once with a ticket id. After that, the client waits for a notification: it keeps one request open and the server answers it the moment the queue position, the holder or the device's health changes. If nothing changes for 25 s, the server answers "still waiting" and the client opens the next request at once; that renewal is the waiter's heartbeat. There is no polling loop, and an AI agent spends no tokens while it waits (see [Using it with AI agents](#using-it-with-ai-agents)).
   - It prints the position to stderr only when the position or the holder changes.
   - It exits once you hold the lock, and the lease starts counting.
   - If you already hold the resource under the same owner name, `acquire` succeeds at once and refreshes the lease.
@@ -114,8 +114,8 @@ curl -s -XPOST $HWLOCK_URL/r/jetson/release -d '{"owner":"job-1"}'              
 - **Resources** are created the first time someone acquires them, for example `jetson`, `gpu0` or `robot-arm`. Each resource has at most one holder, which the database schema enforces: the holder is stored as columns on the resource row.
 - **FIFO.** Tickets get increasing ids, and only the first live (not dormant) waiting ticket can be granted. The grant happens only while that ticket's own client has a request in flight with its connection still open. A waiter that has died is never handed the lock.
 - **Leases.** The default lease is 1800 s (`HWLOCK_DEFAULT_LEASE_S`). You can override it per call with `--lease`, up to `HWLOCK_MAX_LEASE_S`, which defaults to 24 h. When a holder's lease expires, the holder is evicted and an `expire` event is logged. `renew` sets the lease to *now + lease*.
-- **Heartbeats.** Each acquire request a waiting ticket makes counts as its heartbeat, including the long-poll requests. A live ticket with no heartbeat for `HWLOCK_HEARTBEAT_S` (120 s) is dropped (`drop` event).
-  - If the client is killed during a long-poll, the server notices the closed connection within about 1 s and makes the ticket **dormant** at once (`abandon` and `ticket_dormant` events), whatever its position. A dormant ticket keeps its place for `HWLOCK_REATTACH_S` (120 s) but is skipped, so it never blocks the queue or a free lock; see [Keeping your place](#keeping-your-place). Only a client killed in the few milliseconds between two polls waits for the heartbeat timeout instead.
+- **Heartbeats.** Each acquire request a waiting ticket makes counts as its heartbeat, including the open waiting requests. A live ticket with no heartbeat for `HWLOCK_HEARTBEAT_S` (120 s) is dropped (`drop` event).
+  - If the client is killed while waiting, the server notices the closed connection within about 1 s and makes the ticket **dormant** at once (`abandon` and `ticket_dormant` events), whatever its position. A dormant ticket keeps its place for `HWLOCK_REATTACH_S` (120 s) but is skipped, so it never blocks the queue or a free lock; see [Keeping your place](#keeping-your-place). Only a client killed in the few milliseconds between two waiting requests waits for the heartbeat timeout instead.
   - Clients must keep the connection open while they wait: a client that half-closes its socket after sending the request counts as gone.
   - SIGTERM: the client detaches (`POST /detach`, ticket dormant, `ticket_dormant` event with `via: detach`) and exits 143. Ctrl-C: it withdraws the ticket at once (`cancel`) and exits 130.
   - Re-attaching: an acquire without a ticket id finds the owner's dormant (or live) ticket on that resource (`ticket_reattached` event); an acquire with the id of a dormant ticket revives it too. With `HWLOCK_REATTACH_S=0` a hung-up waiter's ticket is dropped at once, as before.
@@ -174,8 +174,8 @@ only after several rounds in a row (hysteresis): `down` after `down_after` (3) d
 degraded rounds, and back after `up_after` clean rounds. With the defaults a dead box is `down` within about 15 to 20 s.
 
 **What happens**
-- Every transition is an event (`health_up`, `health_degraded`, `health_down`), and the server ends every waiting
-  client's long-poll at once, so `acquire` prints the change right away (`WARNING: jetson is DOWN (for 12s): ssh_banner
+- Every transition is an event (`health_up`, `health_degraded`, `health_down`), and the server answers every waiting
+  client's open request at once, so `acquire` prints the change right away (`WARNING: jetson is DOWN (for 12s): ssh_banner
   192.168.0.99:22: TCP accepted but no SSH banner within 3 s (frozen?)`).
 - **While a device is down nobody is granted it**, nor while it is still `unknown` (a newly configured resource, until
   its first probes decide: a few rounds), so a dead box is never handed out before it is known to be dead. The queue
@@ -187,7 +187,7 @@ degraded rounds, and back after `up_after` clean rounds. With the defaults a dea
   after it, for example while the exporter was still starting, is kept). Waiters keep their tickets and FIFO order and
   are told. The voided holder's `renew`/`release` answer 409 with `voided` (`VOIDED_REBOOT`, exit 7), not a plain
   `NOT_HOLDER`. A reboot is only seen through a boot id: without an exporter, a quick reboot looks like a short outage.
-- **Holders** (`run`, `hold`) long-poll `GET /r/<res>/health` next to their renewals, so they learn at once:
+- **Holders** (`run`, `hold`) keep a waiting `GET /r/<res>/health` request open next to their renewals, so they are told at once:
   - `run`: on down or reboot it stops the command (SIGTERM, SIGKILL 10 s later) and exits 6 or 7. `--on-down=warn` only
     warns and returns the command's code. It releases the lock on exit (not needed after a reboot: the lease is void).
   - `hold`: ends at once, exit 6 (lock released) or 7.
@@ -237,7 +237,7 @@ Check it with `curl http://<box>:8771/`, logs with `journalctl --user -u hwlock-
 | `POST /r/<res>/cancel` | Body `{ticket, owner?, attach?}`. Gives the place up (also for a dormant ticket). With `attach`, only when it is the ticket's (or grant's) newest client; otherwise `"state": "superseded"` and nothing changes. |
 | `POST /r/<res>/detach` | Body `{ticket?, owner?, attach?}`. The client is leaving but keeps its place: the ticket turns dormant for the re-attach window. If that ticket was granted meanwhile, the lock is released. `attach` as for cancel. |
 | `POST /r/<res>/force-release` | Body `{by, reason?}`. Needs `HWLOCK_ADMIN_TOKEN` if that is set. |
-| `GET /r/<res>/health?after=SEQ&wait=S` | Health of a resource with probes (404 without): `{health: {state, since, for_s, reason, seq, boot_id, last_reboot, metrics, probes, checked_s_ago}, events, holder}`. With `after`, long-polls up to `wait` s (capped like acquire) until a health event newer than `seq` exists and lists those events. |
+| `GET /r/<res>/health?after=SEQ&wait=S` | Health of a resource with probes (404 without): `{health: {state, since, for_s, reason, seq, boot_id, last_reboot, metrics, probes, checked_s_ago}, events, holder}`. With `after`, keeps the request open up to `wait` s (capped like acquire) and answers as soon as a health event newer than `seq` exists, and lists those events. |
 
 Settings, all optional:
 
@@ -246,7 +246,7 @@ Settings, all optional:
 - `HWLOCK_DEFAULT_LEASE_S`: default lease, 1800.
 - `HWLOCK_MAX_LEASE_S`: maximum lease, 86400.
 - `HWLOCK_HEARTBEAT_S`: heartbeat window for waiting tickets, 120. It must be at least `HWLOCK_POLL_S` + 5.
-- `HWLOCK_POLL_S`: how long the server holds a long-poll, 25.
+- `HWLOCK_POLL_S`: how long the server keeps a waiting request open before answering "no change" (the client then opens the next one; this is the heartbeat), 25. The name is kept for compatibility.
 - `HWLOCK_REATTACH_S`: how long a waiter that hung up or detached keeps its place as a dormant ticket, 120. 0 drops it at once.
 - `HWLOCK_MAX_HOLD_S`: the [starvation guard](#starvation-guard)'s max hold, 7200. Set it to 0 to turn the guard off.
 - `HWLOCK_HOLD_GRACE_S`: the grace period before an over-max holder is evicted, 300.

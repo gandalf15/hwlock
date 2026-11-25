@@ -10,7 +10,7 @@ measurements, run out of memory or break deploys. The `hwlock` service serialise
 
 ## Rules
 1. **Hold the lock for every use of the device**, including "quick" ssh commands, and only then.
-2. **Acquire** (waits in FIFO order; prints the queue position; long-polls - never write your own poll loop):
+2. **Acquire** (waits in FIFO order; prints the queue position; the server notifies the client the moment it is your turn - never write your own wait loop):
    `hwlock acquire <resource> <job-name> "<what for>"`
    `<job-name>` must be unique to your task (e.g. `trt-build-fp16`, `bench-run-3`): renew and
    release are checked against it. Add `--max-wait 1800` if you must not wait forever (exit 3 = gave up).

@@ -32,7 +32,8 @@ subagent i:
 ```
 
 Why it works:
-- Waiting subagents sit in one long-poll each (one request per ~25 s), so a queue of 20 costs nothing.
+- Waiting subagents each keep one open request to the server (renewed every ~25 s as a heartbeat) and are notified when
+  their turn comes, so a queue of 20 costs no tokens and almost no CPU.
 - FIFO order is strict, so no subagent starves; `hwlock status` / the page at `/` shows who waits for what.
 - A subagent whose waiting acquire is killed (crash, tool timeout) keeps its place for 120 s: re-running
   the same acquire (same owner) re-attaches to its ticket. Meanwhile the ticket is skipped, so it never

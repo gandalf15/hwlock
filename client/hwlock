@@ -18,7 +18,8 @@ Single file, Python >= 3.8 standard library only: copy it anywhere.
   hwlock force-release <resource> <by> [reason]          (admin; logged)
 acquire/run/hold also take: --fail-if-down --exit-on-degraded; run also: --on-down kill|warn
 
-acquire waits in FIFO order (long-poll: the server holds each request ~25 s, nobody polls fast),
+acquire waits in FIFO order for the server's notification (one open request, answered the moment
+anything changes; renewed every ~25 s as a heartbeat - no polling loop),
 prints the queue position to stderr while waiting, and exits once you hold the lock. The lease
 (default: server's, 1800 s) then runs; `renew` extends it, `release` ends it.
 `run` acquires, renews in the background while <cmd> runs, and releases on exit, failure or Ctrl-C.
@@ -230,7 +231,7 @@ def server_error_exit(err):
 
 
 class Acquirer(object):
-    """Takes a ticket and long-polls until granted. Survives server restarts (re-attaches by ticket)."""
+    """Takes a ticket and waits for the server's grant notification (one open request at a time). Survives server restarts (re-attaches by ticket)."""
 
     def __init__(self, resource, owner, reason=None, lease=None, max_wait=None, pid=None, max_hold=None,
                  new_ticket=False, fail_if_down=False, exit_on_degraded=False):
@@ -264,7 +265,7 @@ class Acquirer(object):
         last_msg, backoff = None, 1.0
         while True:
             # The first request returns at once with our ticket id, so Ctrl-C can withdraw it and a
-            # server restart can be survived by re-attaching with it. Later requests long-poll.
+            # server restart can be survived by re-attaching with it. Later requests stay open until something changes.
             wait = LONG_POLL_S if self.ticket is not None else 0.0
             if self.max_wait is not None:
                 left = self.max_wait - (time.monotonic() - start)
@@ -314,7 +315,7 @@ class Acquirer(object):
 
     def _on_health(self, out):
         """Tell the user about the device's health as soon as an answer shows a change (the server ends a
-        long-poll early on every health event), and give up if asked to (--fail-if-down, --exit-on-degraded)."""
+        answer the open request early on every health event), and give up if asked to (--fail-if-down, --exit-on-degraded)."""
         hv = out.get("health")
         if not hv:
             return
@@ -508,7 +509,7 @@ class Renewer(threading.Thread):
 
 
 class HealthWatcher(threading.Thread):
-    """For run/hold: long-polls GET /r/<res>/health?after=SEQ, so a holder learns at once that its device
+    """For run/hold: keeps a waiting GET /r/<res>/health?after=SEQ open, so a holder learns at once that its device
     went down, rebooted (lease voided) or degraded, instead of at the next renew. on_event(event, health)
     is called for each health event in order. Quietly ends if the server has no probes for the resource."""
 
