@@ -27,7 +27,8 @@ cmd=${1:-}; shift || true
 case $cmd in
 acquire)
     res=$1 owner=$2 reason=${3:-} lease=${4:-}
-    body="\"owner\": \"$(esc "$owner")\", \"reason\": \"$(esc "$reason")\", \"host\": \"$(hostname)\", \"pid\": $PPID"
+    attach="sh-$$-$RANDOM$RANDOM"   # this process: a late cancel/detach of ours never touches a re-run's ticket
+    body="\"owner\": \"$(esc "$owner")\", \"reason\": \"$(esc "$reason")\", \"host\": \"$(hostname)\", \"pid\": $PPID, \"attach\": \"$attach\""
     [[ -n $lease ]] && body+=", \"lease\": $lease"
     r=$(post "/r/$res/acquire" "{$body, \"wait\": 0}"); last=""
     while :; do
@@ -36,8 +37,8 @@ acquire)
             200) echo "hwlock: $owner holds $res"; exit 0 ;;
             202) ticket=$(field ticket "$json"); msg="waiting for $res: position $(field position "$json"), ticket $ticket"
                  [[ $msg != "$last" ]] && echo "hwlock: $msg" >&2; last=$msg
-                 trap 'post "/r/$res/cancel" "{\"ticket\": $ticket}" >/dev/null; exit 130' INT
-                 trap 'post "/r/$res/detach" "{\"ticket\": $ticket}" >/dev/null; echo "hwlock: SIGTERM; ticket $ticket kept for re-attach" >&2; exit 143' TERM
+                 trap 'post "/r/$res/cancel" "{\"ticket\": $ticket, \"attach\": \"$attach\"}" >/dev/null; exit 130' INT
+                 trap 'post "/r/$res/detach" "{\"ticket\": $ticket, \"attach\": \"$attach\"}" >/dev/null; echo "hwlock: SIGTERM; ticket $ticket kept for re-attach" >&2; exit 143' TERM
                  r=$(post "/r/$res/acquire" "{$body, \"ticket\": $ticket, \"wait\": 25}" 40) ;;
             410) r=$(post "/r/$res/acquire" "{$body, \"wait\": 0}") ;;   # ticket dropped: rejoin
             409) echo "OVER_MAX_HOLD waiting=$(field waiting "$json") evict_in=$(field evict_in_s "$json" | cut -d. -f1)"; exit 5 ;;

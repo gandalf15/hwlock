@@ -110,6 +110,7 @@ curl -s -XPOST $HWLOCK_URL/r/jetson/release -d '{"owner":"job-1"}'              
   - Clients must keep the connection open while they wait: a client that half-closes its socket after sending the request counts as gone.
   - SIGTERM: the client detaches (`POST /detach`, ticket dormant, `ticket_dormant` event with `via: detach`) and exits 143. Ctrl-C: it withdraws the ticket at once (`cancel`) and exits 130.
   - Re-attaching: an acquire without a ticket id finds the owner's dormant (or live) ticket on that resource (`ticket_reattached` event); an acquire with the id of a dormant ticket revives it too. With `HWLOCK_REATTACH_S=0` a hung-up waiter's ticket is dropped at once, as before.
+  - The killed process and its re-run share owner and ticket id, so each client process also sends its own random `attach` id. The newest client of a ticket (the re-run) takes it over: a late `detach` or `cancel` from the old process, or the server noticing the old connection close, then changes nothing (`"state": "superseded"`). Without that, an old client's detach still in flight could release the lock the re-run had just been granted. Requests without an `attach` id (older clients) act as before.
 - **Restarts.** The holder, the queue and the audit log are stored in SQLite.
   - Leases are absolute server timestamps, so they keep counting while the server is down.
   - On startup, every live waiting ticket gets a fresh heartbeat window. Dormant tickets keep their re-attach deadline, which, like a lease, keeps counting while the server is down; one that ran out meanwhile is dropped on startup.
@@ -135,11 +136,11 @@ curl -s -XPOST $HWLOCK_URL/r/jetson/release -d '{"owner":"job-1"}'              
 | `GET /` | HTML status page that refreshes every 3 s. With a token set, open `/?token=…` (a browser cannot send a bearer header). |
 | `GET /status`, `GET /status/<resource>` | JSON: holder (owner, reason, host, pid, since, lease left), `queue` (live waiters) and `dormant` (tickets whose client is gone, with `dormant_left_s` and `position_on_reattach`). |
 | `GET /events?resource=&after=&limit=` | Audit log, with these event kinds: `create`, `enqueue`, `acquire`, `reacquire`, `renew`, `release`, `expire`, `drop`, `abandon`, `ticket_dormant`, `ticket_reattached`, `ticket_dropped`, `cancel`, `force_release`, `renew_refused`, `evict_max_hold`, `server_start`. |
-| `POST /r/<res>/acquire` | Body `{owner, reason?, host?, pid?, lease?, max_hold?, ticket?, new_ticket?, wait?}`. Returns 200 acquired, 202 waiting or 410 ticket gone. Without `ticket` it re-attaches to the owner's dormant or waiting ticket (`"reattached": true`); `new_ticket: true` drops those and joins at the back. Also 409 `over_max_hold` when the holder re-acquires past its max hold while others wait. |
+| `POST /r/<res>/acquire` | Body `{owner, reason?, host?, pid?, lease?, max_hold?, ticket?, new_ticket?, attach?, wait?}`. Returns 200 acquired, 202 waiting or 410 ticket gone. Without `ticket` it re-attaches to the owner's dormant or waiting ticket (`"reattached": true`); `new_ticket: true` drops those and joins at the back. Also 409 `over_max_hold` when the holder re-acquires past its max hold while others wait. |
 | `POST /r/<res>/renew` | Body `{owner, lease?}`. Returns 200, 409 `not_holder`, or 409 `over_max_hold` with `{message, waiting, held_s, max_hold_s, grace_s, evict_at, evict_in_s, lease_left_s}`. |
 | `POST /r/<res>/release` | Body `{owner}`. Returns 200, or 409 not holder. |
-| `POST /r/<res>/cancel` | Body `{ticket, owner?}`. Gives the place up (also for a dormant ticket). |
-| `POST /r/<res>/detach` | Body `{ticket?, owner?}`. The client is leaving but keeps its place: the ticket turns dormant for the re-attach window. If that ticket was granted meanwhile, the lock is released. |
+| `POST /r/<res>/cancel` | Body `{ticket, owner?, attach?}`. Gives the place up (also for a dormant ticket). With `attach`, only when it is the ticket's (or grant's) newest client; otherwise `"state": "superseded"` and nothing changes. |
+| `POST /r/<res>/detach` | Body `{ticket?, owner?, attach?}`. The client is leaving but keeps its place: the ticket turns dormant for the re-attach window. If that ticket was granted meanwhile, the lock is released. `attach` as for cancel. |
 | `POST /r/<res>/force-release` | Body `{by, reason?}`. Needs `HWLOCK_ADMIN_TOKEN` if that is set. |
 
 Settings, all optional:

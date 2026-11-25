@@ -178,10 +178,13 @@ class Acquirer(object):
         self.pid = pid if pid is not None else os.getppid()
         self.ticket = None
         self.granted = False
+        # this process's id for the server: after a re-run of the same acquire re-attaches to our ticket,
+        # a late cancel/detach from this (old) process no longer touches the re-run's ticket or grant
+        self.attach = os.urandom(8).hex()
 
     def _body(self, wait):
         b = {"owner": self.owner, "reason": self.reason, "host": socket.gethostname(),
-             "pid": self.pid, "wait": wait}
+             "pid": self.pid, "wait": wait, "attach": self.attach}
         if self.lease is not None:
             b["lease"] = self.lease
         if self.max_hold is not None:
@@ -246,15 +249,15 @@ class Acquirer(object):
         if self.ticket is None:
             return
         try:
-            call("POST", "/r/%s/cancel" % self.resource, {"ticket": self.ticket, "owner": self.owner},
-                 timeout=5)
+            call("POST", "/r/%s/cancel" % self.resource,
+                 {"ticket": self.ticket, "owner": self.owner, "attach": self.attach}, timeout=5)
         except Exception:
             pass
 
     def detach(self):
         """Keep our place: the server makes our ticket dormant for its re-attach window (also releases
         if it was granted in the meantime). Without a ticket id yet, detach by owner (never releases)."""
-        body = {"owner": self.owner}
+        body = {"owner": self.owner, "attach": self.attach}
         if self.ticket is not None:
             body["ticket"] = self.ticket
         try:
@@ -287,6 +290,9 @@ def acquire_or_exit(resource, owner, reason, lease, max_wait, pid=None, max_hold
             say("terminated (SIGTERM); ticket %s kept for %s: re-run the same acquire (same resource and"
                 " owner) within that time to get your place back (Ctrl-C would have given it up)"
                 % (out.get("ticket"), fmt_s(out.get("window_s"))))
+        elif out.get("state") == "superseded":
+            say("terminated (SIGTERM); a newer run of this acquire (same owner) already took over ticket %s"
+                % out.get("ticket"))
         else:
             say("terminated (SIGTERM); ticket %s kept if the server saw it: re-run the same acquire soon"
                 " to get your place back" % acq.ticket)
