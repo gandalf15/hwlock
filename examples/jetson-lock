@@ -47,5 +47,5 @@ run)
     # shellcheck disable=SC2086  # $SSH is a command line on purpose
     exec "$HWLOCK" run "$RES" "$owner" ${reason[@]+"${reason[@]}"} ${lease[@]+"${lease[@]}"} \
         ${wait[@]+"${wait[@]}"} ${hold[@]+"${hold[@]}"} ${kill[@]+"${kill[@]}"} -- $SSH "$HOST" "$@" ;;
-*) sed -n '2,24p' "$0"; exit 2 ;;
+*) sed -n '2,20p' "$0"; exit 2 ;;
 esac

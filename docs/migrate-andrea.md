@@ -30,8 +30,12 @@ Replace the whole file with this text, and keep the file executable:
 # Env (same as before): JETSON_HOST (marcel@192.168.0.99), JETSON_LOCK_LEASE_S (default: server's 1800),
 # JETSON_LOCK_MAX_WAIT_S (0 = forever). New: HWLOCK_URL, HWLOCK_TOKEN, HWLOCK (path of the client),
 # JETSON_LOCK_RESOURCE (default jetson), JETSON_SSH (the ssh command used by `run`).
+# Starvation guard: the limits live on the server (HWLOCK_MAX_HOLD_S / HWLOCK_HOLD_GRACE_S, or per resource
+# HWLOCK_RESOURCE_MAX_HOLD_S=jetson=7200). JETSON_LOCK_MAX_HOLD_S, if set, asks for a shorter limit for this
+# hold (--max-hold; the server caps it); JETSON_LOCK_GRACE_S is server-side only and ignored here.
+# JETSON_LOCK_KILL_ON_PREEMPT=1: `run` stops the ssh command when the max hold is hit (else it warns).
 # Exit codes: as `hwlock` (0 ok, 1 not holder, 2 usage, 3 gave up after max-wait, 4 server problem,
-# 130 interrupted; run: the remote command's code).
+# 5 OVER_MAX_HOLD, 130 interrupted; run: the remote command's code).
 set -euo pipefail
 HOST=${JETSON_HOST:-marcel@192.168.0.99}
 RES=${JETSON_LOCK_RESOURCE:-jetson}
@@ -39,15 +43,17 @@ SSH=${JETSON_SSH:-ssh -o BatchMode=yes -o ConnectTimeout=10}
 HWLOCK=${HWLOCK:-$(command -v hwlock || echo "$HOME/code/hwlock/client/hwlock")}
 [[ -x $HWLOCK ]] || { echo "jetson-lock: hwlock client not found (set HWLOCK=/path/to/hwlock)" >&2; exit 2; }
 
-lease=(); wait=()
+lease=(); wait=(); hold=(); kill=()
 [[ -n ${JETSON_LOCK_LEASE_S:-} ]] && lease=(--lease "$JETSON_LOCK_LEASE_S")
 [[ ${JETSON_LOCK_MAX_WAIT_S:-0} != 0 ]] && wait=(--max-wait "$JETSON_LOCK_MAX_WAIT_S")
+[[ ${JETSON_LOCK_MAX_HOLD_S:-0} != 0 ]] && hold=(--max-hold "$JETSON_LOCK_MAX_HOLD_S")
+[[ ${JETSON_LOCK_KILL_ON_PREEMPT:-0} != 0 ]] && kill=(--kill-on-preempt)
 
 cmd=${1:-}; shift || true
 case $cmd in
 acquire)
     [[ $# -ge 1 && $# -le 2 ]] || { echo "usage: jetson-lock acquire <owner> [reason]" >&2; exit 2; }
-    exec "$HWLOCK" acquire "$RES" "$@" ${lease[@]+"${lease[@]}"} ${wait[@]+"${wait[@]}"} ;;
+    exec "$HWLOCK" acquire "$RES" "$@" ${lease[@]+"${lease[@]}"} ${wait[@]+"${wait[@]}"} ${hold[@]+"${hold[@]}"} ;;
 renew)   exec "$HWLOCK" renew "$RES" "${1:?usage: jetson-lock renew <owner>}" ${lease[@]+"${lease[@]}"} ;;
 release) exec "$HWLOCK" release "$RES" "${1:?usage: jetson-lock release <owner>}" ;;
 status)  exec "$HWLOCK" status "$RES" ;;
@@ -58,8 +64,8 @@ run)
     shift
     # shellcheck disable=SC2086  # $SSH is a command line on purpose
     exec "$HWLOCK" run "$RES" "$owner" ${reason[@]+"${reason[@]}"} ${lease[@]+"${lease[@]}"} \
-        ${wait[@]+"${wait[@]}"} -- $SSH "$HOST" "$@" ;;
-*) sed -n '2,19p' "$0"; exit 2 ;;
+        ${wait[@]+"${wait[@]}"} ${hold[@]+"${hold[@]}"} ${kill[@]+"${kill[@]}"} -- $SSH "$HOST" "$@" ;;
+*) sed -n '2,20p' "$0"; exit 2 ;;
 esac
 ```
 
@@ -70,12 +76,23 @@ esac
 - The variables `JETSON_HOST`, `JETSON_LOCK_LEASE_S` and `JETSON_LOCK_MAX_WAIT_S` (0 means wait forever). `JETSON_LOCK_POLL_S` is no longer used: clients long-poll instead.
 - The owner format `[A-Za-z0-9._-]{1,64}`, the FIFO order, the 30-minute lease, and the 120 s window after which a waiting ticket that stopped refreshing is dropped.
 - `renew` and `release` print `NOT_HOLDER holder=<owner>` and exit 1 when you are not the holder. A successful `release` prints `RELEASED` and exits 0.
-- The **starvation guard**, but only once the server is configured for it (it is off by default in hwlock): set `HWLOCK_MAX_HOLD_S=7200` and `HWLOCK_HOLD_GRACE_S=300` in `~/code/hwlock/.env` (step 0 of section 3). Then, as before, while others wait a holder may keep the lock at most 2 h from when it took it: `renew` (and re-`acquire`) prints `OVER_MAX_HOLD waiting=N` and exits 1, and 300 s later the holder is evicted (`evict_max_hold` event) and the next in line gets the lock. Nobody waiting = no limit. One difference: `run` renews automatically, so a `run` past 2 h with others waiting prints a warning and loses the lock 300 s later while its ssh command keeps running. Split such jobs, or tell the user.
+- The **starvation guard** from commit 207020b, with the same defaults: hwlock's guard is on by default with a 7200 s max hold and a 300 s grace. While others wait, a holder may keep the lock at most 2 h from when it took it. After that, `renew` (and a re-`acquire`) prints `OVER_MAX_HOLD waiting=N …`, and 300 s later the holder is evicted (`evict_max_hold` event) and the next in line gets the lock. Nobody waiting means no limit.
+
+  The old settings map like this:
+
+  | jetson-lock (client env, every caller) | hwlock |
+  |---|---|
+  | `JETSON_LOCK_MAX_HOLD_S` (7200) | Server: `HWLOCK_MAX_HOLD_S` (all resources, default 7200), or `HWLOCK_RESOURCE_MAX_HOLD_S=jetson=7200` for the Jetson only, in `~/code/hwlock/.env`. The wrapper also passes a `JETSON_LOCK_MAX_HOLD_S` from the caller's env on as `--max-hold`, which can only *lower* the server's limit for that one hold. |
+  | `JETSON_LOCK_GRACE_S` (300) | Server only: `HWLOCK_HOLD_GRACE_S` (default 300), or `HWLOCK_RESOURCE_HOLD_GRACE_S=jetson=300`. The wrapper ignores the variable. |
+  | (none) | `JETSON_LOCK_KILL_ON_PREEMPT=1`: `run` stops the ssh command when the max hold is hit (`--kill-on-preempt`). |
+
+  In the old script the limits lived in each caller's environment, so two callers could disagree. Now the server decides, and all callers see the same deadlines in `scripts/jetson-lock status` and on the page.
 
 ### What changes (all improvements; nobody relies on the old behaviour)
 
 - **Exit codes.**
   - Giving up after `JETSON_LOCK_MAX_WAIT_S` now exits **3** instead of 2.
+  - `OVER_MAX_HOLD` from `renew` now exits **5** instead of 1, so a script can tell it apart from `NOT_HOLDER`.
   - Ctrl-C while waiting exits 130 and withdraws the ticket.
   - When the server is unreachable or rejects a request, the exit code is 4.
   - In the andrea_ai repo, only CLAUDE.md mentions jetson-lock. No script checks its exit codes.
@@ -84,6 +101,8 @@ esac
   - The waiting lines look like `hwlock: waiting for jetson: position 2 of 3, ticket 17, holder X: reason`.
   - `status` prints `jetson: held by … since … lease left … host … pid … reason: …`, then one line per queued ticket.
 - **`run` keeps the lock for long commands.** It renews the lease every lease/3 while the ssh command runs. The old script did not renew, so a `run` longer than 30 min could lose the lock.
+  - Past the max hold with others waiting, `run` stops renewing and warns. By default the ssh command keeps running, and the warning says when the next in line gets the Jetson. Split such jobs, or set `JETSON_LOCK_KILL_ON_PREEMPT=1` so the command is stopped before then (`run` then exits 5).
+- **When the grace starts.** The old script let a waiter break the lock as soon as `now - since > MAX_HOLD + GRACE`. If the first waiter arrived after that point, it broke the lock at once, with no warning to the holder. hwlock evicts at `max(since + max hold, arrival of the oldest waiter) + grace`, so the holder always gets the full grace once someone waits. If the waiter was already queued before `since + max hold`, both give the same deadline.
 - **No ssh round-trip per lock operation.** The lock no longer depends on the Jetson being reachable, and every change is in the audit log. Run `hwlock events jetson` or open the page.
 - **Same owner re-acquiring.** If the owner already holds the lock, `acquire` succeeds at once and refreshes the lease. With the old script it waited behind its own lock.
 
@@ -134,12 +153,10 @@ Running jobs execute the old script's code. bash reads a script while it runs it
 
 ```bash
 cd ~/code/andrea_ai
-# 0. hwlock runs with jetson-lock's starvation guard (2 h max hold while others wait, 300 s grace),
-#    is up, and the 'jetson' resource is free in it
-grep -q '^HWLOCK_MAX_HOLD_S=' ~/code/hwlock/.env 2>/dev/null ||
-  printf 'HWLOCK_MAX_HOLD_S=7200\nHWLOCK_HOLD_GRACE_S=300\n' >> ~/code/hwlock/.env
-(cd ~/code/hwlock && docker compose up -d)   # recreates the container only if the settings changed
+# 0. hwlock runs with jetson-lock's starvation guard (2 h max hold while others wait, 300 s grace). These are
+#    hwlock's defaults, so there is nothing to set unless .env overrides them. hwlock is up, and 'jetson' is free in it.
 docker inspect hwlock-hwlock-1 --format '{{range .Config.Env}}{{println .}}{{end}}' | grep -E 'MAX_HOLD|GRACE'
+#    expect HWLOCK_MAX_HOLD_S=7200 and HWLOCK_HOLD_GRACE_S=300 (or jetson=... in the HWLOCK_RESOURCE_* ones)
 curl -fsS 127.0.0.1:8770/health && ~/code/hwlock/client/hwlock status jetson
 
 # 1. Wait until the OLD lock is idle: "holder: (free)" and an empty "queue:".

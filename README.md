@@ -33,12 +33,12 @@ Open <http://127.0.0.1:8770/> for a status page that refreshes every 3 s.
 ## Client reference
 
 ```text
-hwlock acquire <resource> <owner> [reason] [--lease S] [--max-wait S]
+hwlock acquire <resource> <owner> [reason] [--lease S] [--max-wait S] [--max-hold S]
 hwlock renew   <resource> <owner> [--lease S]
 hwlock release <resource> <owner>
 hwlock status  [resource] [--json]
-hwlock run     <resource> <owner> [reason] [--lease S] [--max-wait S] -- <cmd...>
-hwlock hold    <resource> <owner> [reason] --until-file F [--lease S] [--max-wait S]
+hwlock run     <resource> <owner> [reason] [--lease S] [--max-wait S] [--max-hold S] [--kill-on-preempt] -- <cmd...>
+hwlock hold    <resource> <owner> [reason] --until-file F [--lease S] [--max-wait S] [--max-hold S]
 hwlock events  [resource] [--limit N] [--json]
 hwlock force-release <resource> <by> [reason]      # admin, logged
 ```
@@ -46,10 +46,11 @@ hwlock force-release <resource> <by> [reason]      # admin, logged
 | Exit | Meaning |
 |---|---|
 | 0 | Success. |
-| 1 | You are not the holder (`renew`/`release`), or the resource is not held (`force-release`). The output is `NOT_HOLDER holder=<owner>`. With the starvation guard on (`HWLOCK_MAX_HOLD_S`), also when `renew` or a re-`acquire` is refused because you held it too long while others wait: `OVER_MAX_HOLD waiting=N`. |
+| 1 | You are not the holder (`renew`/`release`), or the resource is not held (`force-release`). The output is `NOT_HOLDER holder=<owner>`. `hold` also exits 1 when its lease was lost for another reason than the max hold. |
 | 2 | Usage error. |
 | 3 | Gave up after `--max-wait`. The ticket was withdrawn. |
 | 4 | The server is unreachable, or it rejected the request: wrong token or invalid input. |
+| 5 | `OVER_MAX_HOLD`: the [starvation guard](#starvation-guard) refused `renew` or a re-`acquire`, because you have held the resource past its max hold while others wait. `renew` prints `OVER_MAX_HOLD waiting=N evict_in=S`. `hold` exits 5 once it lost the lock that way, and `run --kill-on-preempt` exits 5 after stopping the command. |
 | 130 | Interrupted while waiting (Ctrl-C or SIGTERM). The ticket was withdrawn. |
 | `run` | The command's own exit code, or 128+N if the command was killed by signal N. 127 if it could not be started. |
 
@@ -60,8 +61,13 @@ hwlock force-release <resource> <by> [reason]      # admin, logged
   - It exits once you hold the lock, and the lease starts counting.
   - If you already hold the resource under the same owner name, `acquire` succeeds at once and refreshes the lease.
 - **`run`** acquires the lock, then renews it every lease/3 in a background thread while `<cmd>` runs. It releases the lock when the command exits, whether it succeeded, failed or was interrupted. SIGTERM and SIGHUP are forwarded to the command, and so is SIGINT if a terminal Ctrl-C has not already reached it.
+  - If the starvation guard refuses a renew, `run` stops renewing and prints `WARNING: OVER_MAX_HOLD: …` with the time left until the next waiter gets the lock.
+  - **Default:** the command keeps running, and `run` returns its exit code. You are warned that the command may still be running after the lock has gone, and at the end that you should check its results. This is the safe choice for work that must not be cut off halfway, such as flashing.
+  - **`--kill-on-preempt`:** `run` sends SIGTERM to the command at once, then SIGKILL 10 s later, or 1 s before the eviction if that comes sooner. The command is gone before the next holder gets the device, and `run` exits 5. It does the same if the lock is lost in any other way.
 - **`hold`** acquires the lock and keeps renewing it until file `F` exists (or until Ctrl-C/SIGTERM), then releases it. Use it for interactive sessions or for jobs you cannot wrap with `run`:
   `hwlock hold rig marcel "manual debugging" --until-file /tmp/rig.done & … ; touch /tmp/rig.done`
+  A `hold` is exactly the kind of proxy that can sit on a device while nothing uses it. When the starvation guard refuses its renew, it stops renewing, warns, and exits 5 once the next waiter has the lock.
+- **`--max-hold S`** (`acquire`, `run`, `hold`) asks for a shorter max hold than the server's for this hold. The server caps it at its own limit, so you can lower it but not raise it.
 - **Owner names** match `[A-Za-z0-9._-]{1,64}`. Make each one unique per job, for example `quant-exp-3` or `ci-1234`. Renew and release are checked against the owner name.
 
 Environment variables:
@@ -100,6 +106,12 @@ curl -s -XPOST $HWLOCK_URL/r/jetson/release -d '{"owner":"job-1"}'              
   - Leases are absolute server timestamps, so they keep counting while the server is down.
   - On startup, every waiting ticket gets a fresh heartbeat window.
   - Waiting clients retry with backoff (1 s growing to 5 s) and re-attach with their ticket id, keeping their place in the queue.
+- **Starvation guard.** <a id="starvation-guard"></a>Leases only protect against holders that crash. They do not protect against a holder that keeps renewing blindly while doing nothing, which is what happened on 2026-11-25: an idle proxy hold kept the lock while three jobs queued. So, **while at least one ticket waits**, a holder may keep a resource at most its *max hold* (default 7200 s), counted from when it took it (`since`).
+  - After that, `renew` and re-`acquire` are refused with 409 `over_max_hold` (a `renew_refused` event).
+  - The holder is evicted at `max(since + max hold, arrival of the oldest waiter) + grace`, with a default grace of 300 s, and the next waiter gets the lock (an `evict_max_hold` event). Taking the later of the two means a holder that was alone past its max hold still gets the full grace once someone starts waiting.
+  - **Nobody waiting means no limit.** A waiter whose client died is dropped first and never causes an eviction.
+  - `since` and the waiters' arrival times are stored in SQLite, so the deadlines survive a server restart. A re-`acquire` by the holder does not reset them.
+  - The limits can be set globally, per resource, and lowered per acquire with `max_hold`; see the settings below. `GET /status` shows them as `holder.guard`: `{max_hold_s, grace_s}`, plus, while people wait, `waiting`, `refuse_at`, `evict_at`, `refuse_in_s` and `evict_in_s`. The HTML page and `hwlock status` show the deadlines whenever someone waits.
 - **Clock.** The server's clock is the only one that is used. Clients send durations, never timestamps.
 - **Edge cases.**
   - The owner re-acquiring while holding gets the lock back at once and the lease is refreshed (`reacquire` event).
@@ -115,8 +127,8 @@ curl -s -XPOST $HWLOCK_URL/r/jetson/release -d '{"owner":"job-1"}'              
 | `GET /` | HTML status page that refreshes every 3 s. With a token set, open `/?token=…` (a browser cannot send a bearer header). |
 | `GET /status`, `GET /status/<resource>` | JSON: holder (owner, reason, host, pid, since, lease left) and queue. |
 | `GET /events?resource=&after=&limit=` | Audit log, with these event kinds: `create`, `enqueue`, `acquire`, `reacquire`, `renew`, `release`, `expire`, `drop`, `abandon`, `cancel`, `force_release`, `renew_refused`, `evict_max_hold`, `server_start`. |
-| `POST /r/<res>/acquire` | Body `{owner, reason?, host?, pid?, lease?, ticket?, wait?}`. Returns 200 acquired, 202 waiting or 410 ticket gone. |
-| `POST /r/<res>/renew` | Body `{owner, lease?}`. Returns 200, or 409 not holder. |
+| `POST /r/<res>/acquire` | Body `{owner, reason?, host?, pid?, lease?, max_hold?, ticket?, wait?}`. Returns 200 acquired, 202 waiting or 410 ticket gone. Also 409 `over_max_hold` when the holder re-acquires past its max hold while others wait. |
+| `POST /r/<res>/renew` | Body `{owner, lease?}`. Returns 200, 409 `not_holder`, or 409 `over_max_hold` with `{message, waiting, held_s, max_hold_s, grace_s, evict_at, evict_in_s, lease_left_s}`. |
 | `POST /r/<res>/release` | Body `{owner}`. Returns 200, or 409 not holder. |
 | `POST /r/<res>/cancel` | Body `{ticket, owner?}`. |
 | `POST /r/<res>/force-release` | Body `{by, reason?}`. Needs `HWLOCK_ADMIN_TOKEN` if that is set. |
@@ -129,7 +141,9 @@ Settings, all optional:
 - `HWLOCK_MAX_LEASE_S`: maximum lease, 86400.
 - `HWLOCK_HEARTBEAT_S`: heartbeat window for waiting tickets, 120. It must be at least `HWLOCK_POLL_S` + 5.
 - `HWLOCK_POLL_S`: how long the server holds a long-poll, 25.
-- `HWLOCK_MAX_HOLD_S`: starvation guard, 0 (off). When set, a holder that has held a resource longer than this while others wait cannot renew or re-acquire it (409 `over_max_hold`; the CLI prints `OVER_MAX_HOLD waiting=N` and exits 1), and `HWLOCK_HOLD_GRACE_S` (300) later it is evicted (`evict_max_hold` event). Nobody waiting means no limit.
+- `HWLOCK_MAX_HOLD_S`: the [starvation guard](#starvation-guard)'s max hold, 7200. Set it to 0 to turn the guard off.
+- `HWLOCK_HOLD_GRACE_S`: the grace period before an over-max holder is evicted, 300.
+- `HWLOCK_RESOURCE_MAX_HOLD_S`, `HWLOCK_RESOURCE_HOLD_GRACE_S`: per-resource values that override the two above, as `resource=seconds` pairs separated by commas, for example `jetson=7200,robot-arm=0`. The server logs the values it uses at startup.
 - `HWLOCK_SWEEP_S`: how often expired leases and dead tickets are checked, 1.
 - `HWLOCK_DB`, `HWLOCK_HOST`, `HWLOCK_PORT`: where the database lives and where the server listens.
 
@@ -163,6 +177,8 @@ Without Docker: `python3 -m hwlock_server --db ~/.local/share/hwlock.db` (Python
   `hwlock run <resource> <job-name> "<what for>" -- <command>` (auto-renew, always releases).
 - `hwlock status` shows who holds what and why. Never `force-release` someone else's lock; ask the user.
 - If you are told you lost the lock (lease expired), stop using the hardware and acquire again.
+- Never keep the lock for work that is not using the device (no idle `hold`, no blind renew loop). While others
+  wait, a hold ends after 2 h: `OVER_MAX_HOLD` (exit 5) means finish the step, release, and queue again.
 ```
 
 ### Claude Code skill

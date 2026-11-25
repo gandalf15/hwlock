@@ -27,13 +27,18 @@ measurements, run out of memory or break deploys. The `hwlock` service serialise
    and never kill another agent's process to get the device. If something looks stuck, report it to the user.
 7. If `renew`/`release` prints `NOT_HOLDER` or `run` warns "lost", your lease expired: stop touching the
    device, re-acquire, and redo the step whose result is now suspect.
-8. If `renew` prints `OVER_MAX_HOLD` or `run` warns about it, you have held the device too long while others
-   wait, and you will be evicted after a grace period (the message says when): finish or stop the current
-   step, release, and `acquire` again (back of the queue) if you still need the device.
+8. **Starvation guard**: while others wait, nobody may keep a device longer than its max hold (default 2 h
+   from when you took it). If `renew` prints `OVER_MAX_HOLD` (exit 5), or `run`/`hold` warn about it, you
+   will be evicted after a grace period (default 5 min; the message says when). Finish or stop the current
+   step within that time, release, and `acquire` again (back of the queue) if you still need the device.
+   Do not hold the lock "for" a job that is not using the device: no idle `hold`, no blind renew loop.
+   `run` lets the command finish by default (check its results); add `--kill-on-preempt` for commands
+   that must not touch the device once someone else has it.
 
 ## Exit codes
-0 ok - 1 not the holder (or `OVER_MAX_HOLD`) - 2 usage - 3 gave up (`--max-wait`) - 4 server unreachable/rejected
-(check `HWLOCK_URL`, `HWLOCK_TOKEN`) - 130 interrupted - `run`: the command's code.
+0 ok - 1 not the holder - 2 usage - 3 gave up (`--max-wait`) - 4 server unreachable/rejected
+(check `HWLOCK_URL`, `HWLOCK_TOKEN`) - 5 `OVER_MAX_HOLD` (renew refused / `hold` evicted /
+`run --kill-on-preempt` stopped the command) - 130 interrupted - `run`: the command's code.
 
 ## Setup (only if `hwlock` is not on PATH)
 The client is one stdlib-only Python file: `client/hwlock` from the hwlock repository. Server URL
