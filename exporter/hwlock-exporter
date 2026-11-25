@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""hwlock-exporter - a tiny read-only health endpoint for a Linux box (Jetson, GPU box, test rig).
+
+GET /  ->  JSON: boot_id, uptime_s, mem_total_mb, mem_available_mb, swap_free_mb, load1/5/15, ncpu,
+           temps_c {zone type: deg C}, temp_max_c, gpu_load_pct (if the kernel exposes it), nvpmodel
+           (Jetson power mode, if present), psi_mem_some_avg10 / psi_mem_full_avg10 (if present).
+
+The hwlock server polls it (probe type http_json) to see that the box is alive and not about to run out
+of memory, and to notice a reboot (boot_id changes). It only reads /proc and /sys: no secrets, no
+writes, no commands. Python >= 3.8 standard library only; one file: copy it anywhere.
+
+  hwlock-exporter [--bind ADDR] [--port 8771] [--allow CIDR[,CIDR...]]
+                  [--proc /proc] [--sys /sys] [--boot-id-file F] [--nvpmodel-dir /var/lib/nvpmodel]
+
+--allow answers only clients from these networks (others get 403); default: everyone who can reach it.
+--proc/--sys/--boot-id-file/--nvpmodel-dir read the data from elsewhere (tests, containers with the
+host's /proc mounted at another place). Env: HWLOCK_EXPORTER_BIND, HWLOCK_EXPORTER_PORT,
+HWLOCK_EXPORTER_ALLOW.
+"""
+
+import argparse
+import glob
+import ipaddress
+import json
+import os
+import socket
+import sys
+import time
+
+try:
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+except ImportError:  # pragma: no cover - Python < 3.7
+    sys.exit("hwlock-exporter needs Python 3.7 or later")
+
+VERSION = 1
+
+
+def _read(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _num(text):
+    try:
+        return float(text.strip())
+    except (AttributeError, ValueError):
+        return None
+
+
+class Collector(object):
+    def __init__(self, proc="/proc", sysfs="/sys", boot_id_file=None, nvpmodel_dir="/var/lib/nvpmodel"):
+        self.proc, self.sys = proc, sysfs
+        self.boot_id_file = boot_id_file or os.path.join(proc, "sys/kernel/random/boot_id")
+        self.nvpmodel_dir = nvpmodel_dir
+        self._nv_names = None  # power mode id -> name, from the nvpmodel config (read once)
+
+    def meminfo(self, out):
+        text = _read(os.path.join(self.proc, "meminfo")) or ""
+        kb = {}
+        for line in text.splitlines():
+            k, _, v = line.partition(":")
+            parts = v.split()
+            if parts:
+                try:
+                    kb[k.strip()] = int(parts[0])
+                except ValueError:
+                    pass
+        for key, name in (("MemTotal", "mem_total_mb"), ("MemAvailable", "mem_available_mb"),
+                          ("SwapTotal", "swap_total_mb"), ("SwapFree", "swap_free_mb")):
+            if key in kb:
+                out[name] = round(kb[key] / 1024.0, 1)
+
+    def thermal(self, out):
+        temps = {}
+        for zone in sorted(glob.glob(os.path.join(self.sys, "class/thermal/thermal_zone*"))):
+            t = _num(_read(os.path.join(zone, "temp")))
+            if t is None:
+                continue
+            name = (_read(os.path.join(zone, "type")) or os.path.basename(zone)).strip()
+            c = t / 1000.0 if abs(t) > 200 else t  # millidegrees on every kernel we know; tolerate degrees
+            if -40 < c < 150:  # some zones report placeholders such as -256 C when off
+                temps[name] = round(c, 1)
+        if temps:
+            out["temps_c"] = temps
+            out["temp_max_c"] = max(temps.values())
+            for k, v in temps.items():
+                if "gpu" in k.lower():
+                    out["gpu_temp_c"] = v
+                elif "cpu" in k.lower():
+                    out["cpu_temp_c"] = max(v, out.get("cpu_temp_c", v))
+
+    def gpu_load(self, out):
+        # Jetson (Tegra): .../17000000.gpu/load or .../gpu.0/load, in per mille (155 = 15.5 %)
+        pats = ("devices/platform/*gpu*/load", "devices/platform/*/*gpu*/load", "devices/gpu.0/load")
+        for pat in pats:
+            for path in sorted(glob.glob(os.path.join(self.sys, pat))):
+                v = _num(_read(path))
+                if v is not None:
+                    out["gpu_load_pct"] = round(v / 10.0, 1)
+                    return
+
+    def nvpmodel(self, out):
+        status = _read(os.path.join(self.nvpmodel_dir, "status"))
+        if not status or ":" not in status:
+            return
+        mode = status.strip().split(":", 1)[1].lstrip("0") or "0"
+        if self._nv_names is None:
+            self._nv_names = {}
+            conf = _read(((_read(os.path.join(self.nvpmodel_dir, "conf_file_path")) or "").strip())
+                         or "/etc/nvpmodel.conf") or ""
+            for line in conf.splitlines():
+                line = line.strip()
+                if line.startswith("< POWER_MODEL"):
+                    bits = dict(b.split("=", 1) for b in line.strip("<> ").split() if "=" in b)
+                    if "ID" in bits and "NAME" in bits:
+                        self._nv_names[bits["ID"]] = bits["NAME"]
+        out["nvpmodel"] = self._nv_names.get(mode, "mode %s" % mode)
+        out["nvpmodel_id"] = int(mode) if mode.isdigit() else mode
+
+    def collect(self):
+        out = {"exporter": "hwlock-exporter", "version": VERSION, "hostname": socket.gethostname(),
+               "time": round(time.time(), 3)}
+        bid = _read(self.boot_id_file)
+        out["boot_id"] = bid.strip() if bid else None
+        up = _read(os.path.join(self.proc, "uptime"))
+        if up:
+            out["uptime_s"] = _num(up.split()[0])
+        la = (_read(os.path.join(self.proc, "loadavg")) or "").split()
+        if len(la) >= 3:
+            out["load1"], out["load5"], out["load15"] = (_num(x) for x in la[:3])
+        out["ncpu"] = os.cpu_count()
+        self.meminfo(out)
+        psi = _read(os.path.join(self.proc, "pressure/memory"))
+        for line in (psi or "").splitlines():
+            parts = line.split()
+            if parts and parts[0] in ("some", "full"):
+                for p in parts[1:]:
+                    if p.startswith("avg10="):
+                        out["psi_mem_%s_avg10" % parts[0]] = _num(p[6:])
+        for step in (self.thermal, self.gpu_load, self.nvpmodel):
+            try:
+                step(out)
+            except Exception:  # one odd sysfs file must not take the whole answer down
+                pass
+        return out
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "hwlock-exporter/%d" % VERSION
+
+    def log_message(self, fmt, *args):  # quiet: this is polled every few seconds
+        pass
+
+    def _send(self, code, payload):
+        body = json.dumps(payload).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        allow = self.server.allow
+        if allow:
+            try:
+                ip = ipaddress.ip_address(self.client_address[0].split("%")[0])
+                if getattr(ip, "ipv4_mapped", None):
+                    ip = ip.ipv4_mapped
+            except ValueError:
+                ip = None
+            if ip is None or not any(ip in net for net in allow):
+                return self._send(403, {"error": "forbidden"})
+        if self.path.split("?")[0] not in ("/", "/metrics.json"):
+            return self._send(404, {"error": "not_found"})
+        self._send(200, self.server.collector.collect())
+
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def main(argv=None):
+    env = os.environ.get
+    ap = argparse.ArgumentParser(prog="hwlock-exporter", description=__doc__.split("\n\n")[0])
+    ap.add_argument("--bind", default=env("HWLOCK_EXPORTER_BIND", "0.0.0.0"))
+    ap.add_argument("--port", type=int, default=int(env("HWLOCK_EXPORTER_PORT", "8771")))
+    ap.add_argument("--allow", default=env("HWLOCK_EXPORTER_ALLOW", ""),
+                    help="comma-separated networks allowed to read (default: all)")
+    ap.add_argument("--proc", default="/proc")
+    ap.add_argument("--sys", dest="sysfs", default="/sys")
+    ap.add_argument("--boot-id-file")
+    ap.add_argument("--nvpmodel-dir", default="/var/lib/nvpmodel")
+    ap.add_argument("--once", action="store_true", help="print one answer and exit")
+    a = ap.parse_args(argv)
+    collector = Collector(a.proc, a.sysfs, a.boot_id_file, a.nvpmodel_dir)
+    if a.once:
+        print(json.dumps(collector.collect(), indent=2))
+        return 0
+    try:
+        allow = [ipaddress.ip_network(x.strip(), strict=False) for x in a.allow.split(",") if x.strip()]
+    except ValueError as err:
+        ap.error("--allow: %s" % err)
+    Server.address_family = socket.AF_INET6 if ":" in a.bind else socket.AF_INET
+    httpd = Server((a.bind, a.port), Handler)
+    httpd.collector, httpd.allow = collector, allow
+    sys.stderr.write("hwlock-exporter listening on %s:%d%s\n" % (
+        a.bind, httpd.server_address[1], " allow=" + a.allow if allow else ""))
+    sys.stderr.flush()
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
