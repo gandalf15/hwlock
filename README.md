@@ -176,7 +176,9 @@ degraded rounds, and back after `up_after` clean rounds. With the defaults a dea
 - Every transition is an event (`health_up`, `health_degraded`, `health_down`), and the server ends every waiting
   client's long-poll at once, so `acquire` prints the change right away (`WARNING: jetson is DOWN (for 12s): ssh_banner
   192.168.0.99:22: TCP accepted but no SSH banner within 3 s (frozen?)`).
-- **While a device is down nobody is granted it.** The queue keeps its order and moves on when the device is back.
+- **While a device is down nobody is granted it**, nor while it is still `unknown` (a newly configured resource, until
+  its first probes decide: a few rounds), so a dead box is never handed out before it is known to be dead. The queue
+  keeps its order and moves on when the device is back.
   `acquire` keeps waiting and says so; `--fail-if-down` gives up instead (ticket withdrawn, exit 6). A holder keeps its
   lock (and lease) while the device is down: `run` and `hold` end themselves (below).
 - **Reboot**: when an `http_json` probe reports a new `boot_id`, the server logs `rebooted` and voids the holder's

@@ -304,7 +304,9 @@ class Acquirer(object):
                 ("%s%s" % (h["owner"], (": " + h["reason"]) if h.get("reason") else "")) if h else "none",
                 " (%s dormant ticket(s) ahead, skipped unless re-attached)" % out["dormant_ahead"]
                 if out.get("dormant_ahead") else "",
-                "; nobody gets it while it is DOWN" if (out.get("health") or {}).get("state") == "down" else "")
+                {"down": "; nobody gets it while it is DOWN",
+                 "unknown": "; nobody gets it until its health is known (first probes running)"}.get(
+                    (out.get("health") or {}).get("state"), ""))
             if msg != last_msg:
                 say(msg)
                 last_msg = msg

@@ -525,7 +525,9 @@ class Store:
             first = self.db.execute(
                 "SELECT MIN(id) FROM tickets WHERE resource=? AND dormant_until IS NULL",
                 (resource,)).fetchone()[0]
-            paused = self._down(resource)  # never hand out a device that is down; the queue waits
+            # never hand out a device that is down, or not checked yet (a dead box starts as "unknown" until its
+            # probes decide): the queue waits, and the next health event ends the long-poll
+            paused = self._paused(resource)
             if r["holder_owner"] is None and first == ticket and not paused:
                 if not may_grant():
                     # Its turn, but the client already hung up (killed, tool timeout): never hand the
@@ -552,7 +554,7 @@ class Store:
                         "health": self._health_view(resource, now, full=False)}
             return {"state": "waiting", "resource": resource, "ticket": ticket, "reattached": reattached,
                     "health": self._health_view(resource, now, full=False),
-                    **({"paused": "down"} if paused and r["holder_owner"] is None and first == ticket else {}),
+                    **({"paused": paused} if paused and r["holder_owner"] is None and first == ticket else {}),
                     "position": self._position(resource, ticket),
                     "queue_length": self.db.execute(
                         "SELECT COUNT(*) FROM tickets WHERE resource=? AND dormant_until IS NULL",
@@ -769,9 +771,10 @@ class Store:
             return None
         return self.db.execute("SELECT * FROM health WHERE resource=?", (resource,)).fetchone()
 
-    def _down(self, resource) -> bool:
+    def _paused(self, resource) -> str | None:
+        """"down" or "unknown" when no lock may be granted on the resource now, else None."""
         h = self._health_row(resource)
-        return h is not None and h["state"] == "down"
+        return h["state"] if h is not None and h["state"] in ("down", "unknown") else None
 
     def _health_view(self, resource, now, full=True) -> dict | None:
         """The resource's health for answers: state, since, reason, last reboot, `seq` (id of the latest

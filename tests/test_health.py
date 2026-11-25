@@ -291,6 +291,30 @@ def test_waiters_are_told_at_once_and_fail_if_down(jetson):
     assert api.status("jetson")["holder"]["owner"] == "stayer"
 
 
+def test_a_dead_box_is_not_granted_before_its_first_verdict(tmp_path, make_server):
+    """A newly configured resource starts "unknown" until its probes decide. An acquire in that window must
+    wait, not be handed a box that is already dead; --fail-if-down then exits 6 once it is declared down."""
+    port, close = _listener(lambda c: time.sleep(60))  # accepts TCP, never sends a banner: frozen
+    try:
+        cfg = health_config(tmp_path, {"jetson": {"interval_s": 0.5, "down_after": 3, "probes": [
+            {"type": "ssh_banner", "host": "127.0.0.1", "port": port, "timeout_s": 1.5}]}})
+        srv = make_server(HWLOCK_HEALTH_CONFIG=cfg)
+        assert health_state(srv.api) == "unknown"
+        quitter = popen_client(srv, "acquire", "jetson", "early", "--fail-if-down")
+        stayer = popen_client(srv, "acquire", "jetson", "plain")
+        quitter.wait(30)
+        err = quitter.stderr.read()
+        assert quitter.returncode == 6, err
+        assert "until its health is known" in err and "gave up (--fail-if-down)" in err
+        assert health_state(srv.api) == "down"
+        time.sleep(0.5)
+        assert stayer.poll() is None and srv.api.status("jetson")["holder"] is None
+        assert "acquire" not in [e["kind"] for e in srv.api.events("jetson")]
+        stayer.kill()
+    finally:
+        close()
+
+
 def test_acquire_while_down_waits_and_says_so(jetson):
     srv, exp = jetson()
     exp.kill()
