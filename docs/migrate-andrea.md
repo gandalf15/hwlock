@@ -17,30 +17,33 @@ Replace the whole file with this text, and keep the file executable:
 
 ```bash
 #!/usr/bin/env bash
-# jetson-lock - drop-in replacement for the old ssh+mkdir jetson-lock: same verbs, same arguments,
-# now backed by the hwlock service (resource "jetson"). Run on the PC (or any machine that reaches
-# HWLOCK_URL and has ssh to the Jetson).
+# jetson-lock - one lock + a FIFO queue for the Jetson, shared by every agent/workflow (and humans).
+# A thin wrapper over the hwlock service (resource "jetson", http://127.0.0.1:8770, repo gandalf15/hwlock).
 #
-#   jetson-lock acquire <owner> [reason]   # take a ticket, wait in FIFO order, hold the lock
-#   jetson-lock renew   <owner>            # extend the lease
-#   jetson-lock release <owner>            # free it
-#   jetson-lock status                     # holder, lease left, queue
-#   jetson-lock run <owner> [reason] -- <ssh command...>   # acquire, run on the Jetson, release (also on failure)
+#   scripts/jetson-lock acquire <owner> [reason]   # take a ticket, wait your turn in FIFO order, exit 0 = you hold it
+#   scripts/jetson-lock renew   <owner>            # extend the 30-min lease during long Jetson work
+#   scripts/jetson-lock release <owner>            # free it as soon as you are back to PC-only work
+#   scripts/jetson-lock status                     # holder, lease left, queue, Jetson health (no lock needed)
+#   scripts/jetson-lock check                      # one-shot health: 0 up, 8 degraded, 6 down (no lock needed)
+#   scripts/jetson-lock watch [--until up]         # blocks until the Jetson's next health change
+#   scripts/jetson-lock run <owner> [reason] -- <ssh command...>   # acquire, run on the Jetson, release (also on failure)
 #
-# Env (same as before): JETSON_HOST (marcel@192.168.0.99), JETSON_LOCK_LEASE_S (default: server's 1800),
-# JETSON_LOCK_MAX_WAIT_S (0 = forever). New: HWLOCK_URL, HWLOCK_TOKEN, HWLOCK (path of the client),
-# JETSON_LOCK_RESOURCE (default jetson), JETSON_SSH (the ssh command used by `run`).
-# Starvation guard: the limits live on the server (HWLOCK_MAX_HOLD_S / HWLOCK_HOLD_GRACE_S, or per resource
-# HWLOCK_RESOURCE_MAX_HOLD_S=jetson=7200). JETSON_LOCK_MAX_HOLD_S, if set, asks for a shorter limit for this
-# hold (--max-hold; the server caps it); JETSON_LOCK_GRACE_S is server-side only and ignored here.
-# JETSON_LOCK_KILL_ON_PREEMPT=1: `run` stops the ssh command when the max hold is hit (else it warns).
-# Health (if the hwlock server probes the Jetson): nobody is granted it while it is down. JETSON_LOCK_FAIL_IF_DOWN=1:
-# acquire/run give up at once when it is down (exit 6) instead of waiting. `run` stops the ssh command when the
-# Jetson goes down (6) or reboots (7). `jetson-lock watch [--until up]` blocks until its next health change.
-# Exit codes: as `hwlock` (0 ok, 1 not holder, 2 usage, 3 gave up after max-wait, 4 server problem,
-# 5 OVER_MAX_HOLD, 6 Jetson DOWN, 7 Jetson REBOOTED (lease voided), 8 DEGRADED (watch), 130 Ctrl-C while waiting
-# (ticket cancelled), 143 SIGTERM while waiting (ticket kept: re-run the same acquire within 120 s to keep the
-# place); run: the remote command's code).
+# AI agents: start `acquire` (and `watch`) as a BACKGROUND command and keep working; the harness notifies you when
+# it exits. Never loop, sleep or grep over its output (tokens). Read-only checks need no lock.
+# Waiting: the client keeps one request open to the hwlock server, which answers the moment it is your turn or the
+# Jetson's health changes (renewed every ~25 s as a heartbeat). No polling loop.
+# Keeping your place: a killed acquire (tool timeout, SIGTERM) keeps its ticket for 120 s; running the same acquire
+# again re-attaches and keeps the place. Ctrl-C cancels. The holder re-running acquire returns at once.
+# Starvation guard (server): while others wait, nobody keeps it longer than 2 h; then renew is refused (exit 5)
+# and 5 min later the next in line gets it. Nobody waiting = no limit.
+# Health (server probes: ssh banner + boot id/memory/temps): nobody is granted the Jetson while it is down; a holder's
+# `run` is stopped when it goes down (exit 6) or reboots (exit 7, lease voided). Status page: http://127.0.0.1:8770/
+#
+# Exit codes: 0 ok, 1 not holder, 2 usage, 3 gave up (JETSON_LOCK_MAX_WAIT_S), 4 hwlock server problem, 5 over max hold,
+# 6 Jetson DOWN, 7 Jetson REBOOTED, 8 DEGRADED, 130 Ctrl-C while waiting, 143 SIGTERM while waiting; run: the command's.
+# Env: JETSON_HOST, JETSON_LOCK_LEASE_S, JETSON_LOCK_MAX_WAIT_S (0 = forever), JETSON_LOCK_MAX_HOLD_S,
+# JETSON_LOCK_KILL_ON_PREEMPT=1, JETSON_LOCK_FAIL_IF_DOWN=1, JETSON_LOCK_RESOURCE (default jetson; tests), HWLOCK,
+# HWLOCK_URL, HWLOCK_TOKEN, JETSON_SSH. The previous ssh+mkdir prototype is in git history (before this commit).
 set -euo pipefail
 HOST=${JETSON_HOST:-marcel@192.168.0.99}
 RES=${JETSON_LOCK_RESOURCE:-jetson}
@@ -63,6 +66,7 @@ acquire)
 renew)   exec "$HWLOCK" renew "$RES" "${1:?usage: jetson-lock renew <owner>}" ${lease[@]+"${lease[@]}"} ;;
 release) exec "$HWLOCK" release "$RES" "${1:?usage: jetson-lock release <owner>}" ;;
 status)  exec "$HWLOCK" status "$RES" ;;
+check)   exec "$HWLOCK" check "$RES" "$@" ;;
 watch)   exec "$HWLOCK" watch "$RES" "$@" ;;
 run)
     owner=${1:?usage: jetson-lock run <owner> [reason] -- <command>}; shift; reason=()
@@ -72,7 +76,7 @@ run)
     # shellcheck disable=SC2086  # $SSH is a command line on purpose
     exec "$HWLOCK" run "$RES" "$owner" ${reason[@]+"${reason[@]}"} ${lease[@]+"${lease[@]}"} \
         ${wait[@]+"${wait[@]}"} ${hold[@]+"${hold[@]}"} ${kill[@]+"${kill[@]}"} -- $SSH "$HOST" "$@" ;;
-*) sed -n '2,25p' "$0"; exit 2 ;;
+*) sed -n '2,/^set -euo/p' "$0" | sed -e '$d' -e 's/^# //' -e 's/^#$//'; exit 2 ;;
 esac
 ```
 
@@ -156,6 +160,8 @@ The Jetson cannot reach `127.0.0.1:8770` on the PC. There are two ways to fix th
 **B: check on the PC instead.** Drop `need_lock` from the Jetson scripts and always start them through `scripts/jetson-lock run <owner> -- …`. The lock is then guaranteed for the whole command, which `run` now keeps renewed. This needs no LAN exposure, but you lose the in-script guard for steps that are started by hand.
 
 ## 3. Switch procedure (main session, when the old queue is empty)
+
+**Done on 2026-11-25 21:30** (andrea_ai 68ee6c9): fenced, swapped, smoke-tested. The quant scripts were left as they are (experiment closed; their `need_lock` aborts safely).
 
 Running jobs execute the old script's code. bash reads a script while it runs it, so **replace the file with `mv`, never by editing it in place.** A running bash keeps the old inode and is not affected.
 
