@@ -69,6 +69,7 @@ def test_waiting_prints_queue_position_then_acquires(server):
     run_client(server, "release", "jetson", "a")
     p1.wait(10)
     assert holder(server.api) == "w1"
+    time.sleep(1.5)  # let w2 see (and print) its new position before w1 releases
     run_client(server, "release", "jetson", "w1")
     p2.wait(10)
     err1, err2 = p1.stderr.read(), p2.stderr.read()
