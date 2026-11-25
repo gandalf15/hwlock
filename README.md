@@ -33,12 +33,12 @@ Open <http://127.0.0.1:8770/> for a status page that refreshes every 3 s.
 ## Client reference
 
 ```text
-hwlock acquire <resource> <owner> [reason] [--lease S] [--max-wait S] [--max-hold S]
+hwlock acquire <resource> <owner> [reason] [--lease S] [--max-wait S] [--max-hold S] [--new-ticket]
 hwlock renew   <resource> <owner> [--lease S]
 hwlock release <resource> <owner>
 hwlock status  [resource] [--json]
-hwlock run     <resource> <owner> [reason] [--lease S] [--max-wait S] [--max-hold S] [--kill-on-preempt] -- <cmd...>
-hwlock hold    <resource> <owner> [reason] --until-file F [--lease S] [--max-wait S] [--max-hold S]
+hwlock run     <resource> <owner> [reason] [--lease S] [--max-wait S] [--max-hold S] [--new-ticket] [--kill-on-preempt] -- <cmd...>
+hwlock hold    <resource> <owner> [reason] --until-file F [--lease S] [--max-wait S] [--max-hold S] [--new-ticket]
 hwlock events  [resource] [--limit N] [--json]
 hwlock force-release <resource> <by> [reason]      # admin, logged
 ```
@@ -51,7 +51,8 @@ hwlock force-release <resource> <by> [reason]      # admin, logged
 | 3 | Gave up after `--max-wait`. The ticket was withdrawn. |
 | 4 | The server is unreachable, or it rejected the request: wrong token or invalid input. |
 | 5 | `OVER_MAX_HOLD`: the [starvation guard](#starvation-guard) refused `renew` or a re-`acquire`, because you have held the resource past its max hold while others wait. `renew` prints `OVER_MAX_HOLD waiting=N evict_in=S`. `hold` exits 5 once it lost the lock that way, and `run --kill-on-preempt` exits 5 after stopping the command. |
-| 130 | Interrupted while waiting (Ctrl-C or SIGTERM). The ticket was withdrawn. |
+| 130 | Ctrl-C (SIGINT) while waiting. The ticket was withdrawn: you gave up your place. |
+| 143 | SIGTERM while waiting, for example a tool timeout or `timeout`. The ticket was **kept**: it is dormant for the server's re-attach window (120 s), and re-running the same `acquire` within it gets your place back. See [Keeping your place](#keeping-your-place). |
 | `run` | The command's own exit code, or 128+N if the command was killed by signal N. 127 if it could not be started. |
 
 ### Commands
@@ -67,8 +68,14 @@ hwlock force-release <resource> <by> [reason]      # admin, logged
 - **`hold`** acquires the lock and keeps renewing it until file `F` exists (or until Ctrl-C/SIGTERM), then releases it. Use it for interactive sessions or for jobs you cannot wrap with `run`:
   `hwlock hold rig marcel "manual debugging" --until-file /tmp/rig.done & … ; touch /tmp/rig.done`
   A `hold` is exactly the kind of proxy that can sit on a device while nothing uses it. When the starvation guard refuses its renew, it stops renewing, warns, and exits 5 once the next waiter has the lock.
+- **Keeping your place.** <a id="keeping-your-place"></a>AI agents' shell commands get killed by tool timeouts and are simply run again. So a waiting client that is stopped with SIGTERM, or killed outright, does not give up its place:
+  - Its ticket turns **dormant** on the server for `HWLOCK_REATTACH_S` (120 s). The Python client also tells the server at once, prints `ticket N kept for 2m00s`, and exits 143.
+  - A new `acquire` (or `run`/`hold`) with the **same resource and owner** within that window re-attaches to that ticket (`re-attached to ticket N` on stderr) and is back at its old place among the tickets not yet served. If the lock went to people behind it meanwhile, that is fine: it simply comes next.
+  - A dormant ticket is skipped while dormant: the next connected waiter is served, and a free lock is never held up by it.
+  - After the window it is dropped (`ticket_dropped` event), and the next `acquire` joins at the back.
+  - Ctrl-C (SIGINT) still gives the place up (the ticket is cancelled, exit 130). `--new-ticket` drops any old ticket of this owner and joins at the back.
 - **`--max-hold S`** (`acquire`, `run`, `hold`) asks for a shorter max hold than the server's for this hold. The server caps it at its own limit, so you can lower it but not raise it.
-- **Owner names** match `[A-Za-z0-9._-]{1,64}`. Make each one unique per job, for example `quant-exp-3` or `ci-1234`. Renew and release are checked against the owner name.
+- **Owner names** match `[A-Za-z0-9._-]{1,64}`. Make each one unique per job, for example `quant-exp-3` or `ci-1234`. Renew and release are checked against the owner name, and so is re-attaching: two clients that wait at the same time with the same owner on one resource share one ticket. When it is granted, both get the lock (as a re-acquire by the holder would), and a Ctrl-C in either one cancels the shared ticket.
 
 Environment variables:
 
@@ -96,20 +103,21 @@ curl -s -XPOST $HWLOCK_URL/r/jetson/release -d '{"owner":"job-1"}'              
 ## Semantics
 
 - **Resources** are created the first time someone acquires them, for example `jetson`, `gpu0` or `robot-arm`. Each resource has at most one holder, which the database schema enforces: the holder is stored as columns on the resource row.
-- **FIFO.** Tickets get increasing ids, and only the first waiting ticket can be granted. The grant happens only while that ticket's own client has a request in flight with its connection still open. A waiter that has died is never handed the lock.
+- **FIFO.** Tickets get increasing ids, and only the first live (not dormant) waiting ticket can be granted. The grant happens only while that ticket's own client has a request in flight with its connection still open. A waiter that has died is never handed the lock.
 - **Leases.** The default lease is 1800 s (`HWLOCK_DEFAULT_LEASE_S`). You can override it per call with `--lease`, up to `HWLOCK_MAX_LEASE_S`, which defaults to 24 h. When a holder's lease expires, the holder is evicted and an `expire` event is logged. `renew` sets the lease to *now + lease*.
-- **Heartbeats.** Each acquire request a waiting ticket makes counts as its heartbeat, including the long-poll requests. A ticket with no heartbeat for `HWLOCK_HEARTBEAT_S` (120 s) is dropped (`drop` event). A client that crashes while waiting therefore loses its place.
-  - If the client is killed during a long-poll, the server notices the closed connection within about 1 s and drops the ticket at once (`abandon` event), whatever its position. Only a client killed in the few milliseconds between two polls waits for the heartbeat timeout instead.
+- **Heartbeats.** Each acquire request a waiting ticket makes counts as its heartbeat, including the long-poll requests. A live ticket with no heartbeat for `HWLOCK_HEARTBEAT_S` (120 s) is dropped (`drop` event).
+  - If the client is killed during a long-poll, the server notices the closed connection within about 1 s and makes the ticket **dormant** at once (`abandon` and `ticket_dormant` events), whatever its position. A dormant ticket keeps its place for `HWLOCK_REATTACH_S` (120 s) but is skipped, so it never blocks the queue or a free lock; see [Keeping your place](#keeping-your-place). Only a client killed in the few milliseconds between two polls waits for the heartbeat timeout instead.
   - Clients must keep the connection open while they wait: a client that half-closes its socket after sending the request counts as gone.
-  - If the client is stopped with Ctrl-C or SIGTERM, it withdraws its ticket at once.
+  - SIGTERM: the client detaches (`POST /detach`, ticket dormant, `ticket_dormant` event with `via: detach`) and exits 143. Ctrl-C: it withdraws the ticket at once (`cancel`) and exits 130.
+  - Re-attaching: an acquire without a ticket id finds the owner's dormant (or live) ticket on that resource (`ticket_reattached` event); an acquire with the id of a dormant ticket revives it too. With `HWLOCK_REATTACH_S=0` a hung-up waiter's ticket is dropped at once, as before.
 - **Restarts.** The holder, the queue and the audit log are stored in SQLite.
   - Leases are absolute server timestamps, so they keep counting while the server is down.
-  - On startup, every waiting ticket gets a fresh heartbeat window.
+  - On startup, every live waiting ticket gets a fresh heartbeat window. Dormant tickets keep their re-attach deadline, which, like a lease, keeps counting while the server is down; one that ran out meanwhile is dropped on startup.
   - Waiting clients retry with backoff (1 s growing to 5 s) and re-attach with their ticket id, keeping their place in the queue.
 - **Starvation guard.** <a id="starvation-guard"></a>Leases only protect against holders that crash. They do not protect against a holder that keeps renewing blindly while doing nothing, which is what happened on 2026-11-25: an idle proxy hold kept the lock while three jobs queued. So, **while at least one ticket waits**, a holder may keep a resource at most its *max hold* (default 7200 s), counted from when it took it (`since`).
   - After that, `renew` and re-`acquire` are refused with 409 `over_max_hold` (a `renew_refused` event).
   - The holder is evicted at `max(since + max hold, arrival of the oldest waiter) + grace`, with a default grace of 300 s, and the next waiter gets the lock (an `evict_max_hold` event). Taking the later of the two means a holder that was alone past its max hold still gets the full grace once someone starts waiting.
-  - **Nobody waiting means no limit.** A waiter whose client died is dropped first and never causes an eviction.
+  - **Nobody waiting means no limit.** A waiter whose client died is dropped first (or is dormant) and never causes an eviction. A ticket that re-attaches counts as waiting from its re-attach, so the holder still gets the full grace.
   - `since` and the waiters' arrival times are stored in SQLite, so the deadlines survive a server restart. A re-`acquire` by the holder does not reset them.
   - The limits can be set globally, per resource, and lowered per acquire with `max_hold`; see the settings below. `GET /status` shows them as `holder.guard`: `{max_hold_s, grace_s}`, plus, while people wait, `waiting`, `refuse_at`, `evict_at`, `refuse_in_s` and `evict_in_s`. The HTML page and `hwlock status` show the deadlines whenever someone waits.
 - **Clock.** The server's clock is the only one that is used. Clients send durations, never timestamps.
@@ -125,12 +133,13 @@ curl -s -XPOST $HWLOCK_URL/r/jetson/release -d '{"owner":"job-1"}'              
 |---|---|
 | `GET /health` | Liveness check. It never needs a token. |
 | `GET /` | HTML status page that refreshes every 3 s. With a token set, open `/?token=…` (a browser cannot send a bearer header). |
-| `GET /status`, `GET /status/<resource>` | JSON: holder (owner, reason, host, pid, since, lease left) and queue. |
-| `GET /events?resource=&after=&limit=` | Audit log, with these event kinds: `create`, `enqueue`, `acquire`, `reacquire`, `renew`, `release`, `expire`, `drop`, `abandon`, `cancel`, `force_release`, `renew_refused`, `evict_max_hold`, `server_start`. |
-| `POST /r/<res>/acquire` | Body `{owner, reason?, host?, pid?, lease?, max_hold?, ticket?, wait?}`. Returns 200 acquired, 202 waiting or 410 ticket gone. Also 409 `over_max_hold` when the holder re-acquires past its max hold while others wait. |
+| `GET /status`, `GET /status/<resource>` | JSON: holder (owner, reason, host, pid, since, lease left), `queue` (live waiters) and `dormant` (tickets whose client is gone, with `dormant_left_s` and `position_on_reattach`). |
+| `GET /events?resource=&after=&limit=` | Audit log, with these event kinds: `create`, `enqueue`, `acquire`, `reacquire`, `renew`, `release`, `expire`, `drop`, `abandon`, `ticket_dormant`, `ticket_reattached`, `ticket_dropped`, `cancel`, `force_release`, `renew_refused`, `evict_max_hold`, `server_start`. |
+| `POST /r/<res>/acquire` | Body `{owner, reason?, host?, pid?, lease?, max_hold?, ticket?, new_ticket?, wait?}`. Returns 200 acquired, 202 waiting or 410 ticket gone. Without `ticket` it re-attaches to the owner's dormant or waiting ticket (`"reattached": true`); `new_ticket: true` drops those and joins at the back. Also 409 `over_max_hold` when the holder re-acquires past its max hold while others wait. |
 | `POST /r/<res>/renew` | Body `{owner, lease?}`. Returns 200, 409 `not_holder`, or 409 `over_max_hold` with `{message, waiting, held_s, max_hold_s, grace_s, evict_at, evict_in_s, lease_left_s}`. |
 | `POST /r/<res>/release` | Body `{owner}`. Returns 200, or 409 not holder. |
-| `POST /r/<res>/cancel` | Body `{ticket, owner?}`. |
+| `POST /r/<res>/cancel` | Body `{ticket, owner?}`. Gives the place up (also for a dormant ticket). |
+| `POST /r/<res>/detach` | Body `{ticket?, owner?}`. The client is leaving but keeps its place: the ticket turns dormant for the re-attach window. If that ticket was granted meanwhile, the lock is released. |
 | `POST /r/<res>/force-release` | Body `{by, reason?}`. Needs `HWLOCK_ADMIN_TOKEN` if that is set. |
 
 Settings, all optional:
@@ -141,6 +150,7 @@ Settings, all optional:
 - `HWLOCK_MAX_LEASE_S`: maximum lease, 86400.
 - `HWLOCK_HEARTBEAT_S`: heartbeat window for waiting tickets, 120. It must be at least `HWLOCK_POLL_S` + 5.
 - `HWLOCK_POLL_S`: how long the server holds a long-poll, 25.
+- `HWLOCK_REATTACH_S`: how long a waiter that hung up or detached keeps its place as a dormant ticket, 120. 0 drops it at once.
 - `HWLOCK_MAX_HOLD_S`: the [starvation guard](#starvation-guard)'s max hold, 7200. Set it to 0 to turn the guard off.
 - `HWLOCK_HOLD_GRACE_S`: the grace period before an over-max holder is evicted, 300.
 - `HWLOCK_RESOURCE_MAX_HOLD_S`, `HWLOCK_RESOURCE_HOLD_GRACE_S`: per-resource values that override the two above, as `resource=seconds` pairs separated by commas, for example `jetson=7200,robot-arm=0`. The server logs the values it uses at startup.
@@ -171,6 +181,8 @@ Without Docker: `python3 -m hwlock_server --db ~/.local/share/hwlock.db` (Python
   Never use it without holding its lock: no ssh commands, deploys, benchmarks, model loads, builds or live tests.
 - Take it: `hwlock acquire <resource> <job-name> "<what for>"`. It waits its turn in FIFO order and prints the
   queue position; do not poll, sleep-loop or pgrep for other jobs instead. Use a unique job name per task.
+  If a tool timeout kills the waiting acquire, just run the same command again within 2 min: it keeps its place.
+  Ctrl-C (or `--new-ticket`) gives the place up.
 - Release it as soon as you go back to local work: `hwlock release <resource> <job-name>`.
   Acquire again later if you need it again; do not sit on it while you think, edit or wait for a human.
 - Long work: `hwlock renew <resource> <job-name>` at least every 10 min (lease 30 min), or wrap one command:

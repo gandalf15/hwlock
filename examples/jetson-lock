@@ -17,7 +17,8 @@
 # hold (--max-hold; the server caps it); JETSON_LOCK_GRACE_S is server-side only and ignored here.
 # JETSON_LOCK_KILL_ON_PREEMPT=1: `run` stops the ssh command when the max hold is hit (else it warns).
 # Exit codes: as `hwlock` (0 ok, 1 not holder, 2 usage, 3 gave up after max-wait, 4 server problem,
-# 5 OVER_MAX_HOLD, 130 interrupted; run: the remote command's code).
+# 5 OVER_MAX_HOLD, 130 Ctrl-C while waiting (ticket cancelled), 143 SIGTERM while waiting (ticket kept: re-run
+# the same acquire within 120 s to keep the place); run: the remote command's code).
 set -euo pipefail
 HOST=${JETSON_HOST:-marcel@192.168.0.99}
 RES=${JETSON_LOCK_RESOURCE:-jetson}
@@ -47,5 +48,5 @@ run)
     # shellcheck disable=SC2086  # $SSH is a command line on purpose
     exec "$HWLOCK" run "$RES" "$owner" ${reason[@]+"${reason[@]}"} ${lease[@]+"${lease[@]}"} \
         ${wait[@]+"${wait[@]}"} ${hold[@]+"${hold[@]}"} ${kill[@]+"${kill[@]}"} -- $SSH "$HOST" "$@" ;;
-*) sed -n '2,20p' "$0"; exit 2 ;;
+*) sed -n '2,22p' "$0"; exit 2 ;;
 esac

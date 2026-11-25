@@ -31,8 +31,10 @@ subagent i:
 Why it works:
 - Waiting subagents sit in one long-poll each (one request per ~25 s), so a queue of 20 costs nothing.
 - FIFO order is strict, so no subagent starves; `hwlock status` / the page at `/` shows who waits for what.
-- A subagent that crashes loses its ticket after 120 s and its lease after 30 min (or at once on Ctrl-C),
-  so the device never stays locked forever.
+- A subagent whose waiting acquire is killed (crash, tool timeout) keeps its place for 120 s: re-running
+  the same acquire (same owner) re-attaches to its ticket. Meanwhile the ticket is skipped, so it never
+  blocks the others; after 120 s it is dropped. Ctrl-C gives the place up at once. A holder that crashes
+  loses the lock when its lease runs out (30 min), so the device never stays locked forever.
 - An orchestrator that must stop everything can see holders in `hwlock status --json` and ask
   them to finish; `force-release` is for humans and is logged.
 

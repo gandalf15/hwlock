@@ -14,6 +14,10 @@ measurements, run out of memory or break deploys. The `hwlock` service serialise
    `hwlock acquire <resource> <job-name> "<what for>"`
    `<job-name>` must be unique to your task (e.g. `trt-build-fp16`, `bench-run-3`): renew and
    release are checked against it. Add `--max-wait 1800` if you must not wait forever (exit 3 = gave up).
+   **Your acquire was killed by a tool timeout (exit 143)?** Just run the very same command again within
+   2 min: the server kept your ticket (dormant) and you get your place back ("re-attached to ticket N").
+   Do not switch to a new job name for the retry, or you join at the back. Ctrl-C (exit 130) or
+   `--new-ticket` gives the place up. Prefer running a long wait in the background so it is not killed.
 3. **Release as soon as you go back to local work** (editing, analysing results, waiting for a human):
    `hwlock release <resource> <job-name>`. Acquire again when you need the device again.
 4. **Long work**: the lease is 30 min by default. Either renew at least every 10 min
@@ -38,7 +42,8 @@ measurements, run out of memory or break deploys. The `hwlock` service serialise
 ## Exit codes
 0 ok - 1 not the holder - 2 usage - 3 gave up (`--max-wait`) - 4 server unreachable/rejected
 (check `HWLOCK_URL`, `HWLOCK_TOKEN`) - 5 `OVER_MAX_HOLD` (renew refused / `hold` evicted /
-`run --kill-on-preempt` stopped the command) - 130 interrupted - `run`: the command's code.
+`run --kill-on-preempt` stopped the command) - 130 Ctrl-C while waiting (place given up) - 143 SIGTERM
+while waiting (place kept: re-run the same acquire) - `run`: the command's code.
 
 ## Setup (only if `hwlock` is not on PATH)
 The client is one stdlib-only Python file: `client/hwlock` from the hwlock repository. Server URL

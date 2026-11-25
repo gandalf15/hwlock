@@ -35,7 +35,8 @@ Replace the whole file with this text, and keep the file executable:
 # hold (--max-hold; the server caps it); JETSON_LOCK_GRACE_S is server-side only and ignored here.
 # JETSON_LOCK_KILL_ON_PREEMPT=1: `run` stops the ssh command when the max hold is hit (else it warns).
 # Exit codes: as `hwlock` (0 ok, 1 not holder, 2 usage, 3 gave up after max-wait, 4 server problem,
-# 5 OVER_MAX_HOLD, 130 interrupted; run: the remote command's code).
+# 5 OVER_MAX_HOLD, 130 Ctrl-C while waiting (ticket cancelled), 143 SIGTERM while waiting (ticket kept: re-run
+# the same acquire within 120 s to keep the place); run: the remote command's code).
 set -euo pipefail
 HOST=${JETSON_HOST:-marcel@192.168.0.99}
 RES=${JETSON_LOCK_RESOURCE:-jetson}
@@ -65,7 +66,7 @@ run)
     # shellcheck disable=SC2086  # $SSH is a command line on purpose
     exec "$HWLOCK" run "$RES" "$owner" ${reason[@]+"${reason[@]}"} ${lease[@]+"${lease[@]}"} \
         ${wait[@]+"${wait[@]}"} ${hold[@]+"${hold[@]}"} ${kill[@]+"${kill[@]}"} -- $SSH "$HOST" "$@" ;;
-*) sed -n '2,20p' "$0"; exit 2 ;;
+*) sed -n '2,22p' "$0"; exit 2 ;;
 esac
 ```
 
@@ -75,6 +76,7 @@ esac
   `run` still runs the command **on the Jetson over ssh** (`ssh -o BatchMode=yes -o ConnectTimeout=10 $JETSON_HOST ...`), and it still releases the lock when the command fails.
 - The variables `JETSON_HOST`, `JETSON_LOCK_LEASE_S` and `JETSON_LOCK_MAX_WAIT_S` (0 means wait forever). `JETSON_LOCK_POLL_S` is no longer used: clients long-poll instead.
 - The owner format `[A-Za-z0-9._-]{1,64}`, the FIFO order, the 30-minute lease, and the 120 s window after which a waiting ticket that stopped refreshing is dropped.
+- **Keeping the place after a tool timeout** (andrea_ai commit 708fa93): an `acquire` killed with SIGTERM exits 143 and keeps its ticket; re-running `acquire` with the same owner within 120 s re-attaches to it and keeps its place. Ctrl-C exits 130 and cancels the ticket. The holder's own `acquire` returns at once. hwlock does this on the server: the killed waiter's ticket turns *dormant* (`ticket_dormant` event) for `HWLOCK_REATTACH_S` (default 120), and `status` lists it under the queue as `DORMANT`. One difference, an improvement: in the old script a killed waiter's ticket at the head of the queue still held up a free lock until its 120 s ran out; a dormant ticket is skipped, so the next live waiter goes at once and the dormant one comes next if it re-attaches in time. `--new-ticket` (hwlock client only) joins at the back on purpose.
 - `renew` and `release` print `NOT_HOLDER holder=<owner>` and exit 1 when you are not the holder. A successful `release` prints `RELEASED` and exits 0.
 - The **starvation guard** from commit 207020b, with the same defaults: hwlock's guard is on by default with a 7200 s max hold and a 300 s grace. While others wait, a holder may keep the lock at most 2 h from when it took it. After that, `renew` (and a re-`acquire`) prints `OVER_MAX_HOLD waiting=N …`, and 300 s later the holder is evicted (`evict_max_hold` event) and the next in line gets the lock. Nobody waiting means no limit.
 
@@ -93,13 +95,13 @@ esac
 - **Exit codes.**
   - Giving up after `JETSON_LOCK_MAX_WAIT_S` now exits **3** instead of 2.
   - `OVER_MAX_HOLD` from `renew` now exits **5** instead of 1, so a script can tell it apart from `NOT_HOLDER`.
-  - Ctrl-C while waiting exits 130 and withdraws the ticket.
+  - Ctrl-C while waiting exits 130 and withdraws the ticket; SIGTERM exits 143 and keeps it, as in the old script since 708fa93.
   - When the server is unreachable or rejects a request, the exit code is 4.
   - In the andrea_ai repo, only CLAUDE.md mentions jetson-lock. No script checks its exit codes.
 - **Output.**
   - A successful `renew` prints `RENEWED lease left 30m00s` instead of `RENEWED`.
   - The waiting lines look like `hwlock: waiting for jetson: position 2 of 3, ticket 17, holder X: reason`.
-  - `status` prints `jetson: held by … since … lease left … host … pid … reason: …`, then one line per queued ticket.
+  - `status` prints `jetson: held by … since … lease left … host … pid … reason: …`, then one line per queued ticket, then one `DORMANT` line per ticket whose client is gone but may re-attach.
 - **`run` keeps the lock for long commands.** It renews the lease every lease/3 while the ssh command runs. The old script did not renew, so a `run` longer than 30 min could lose the lock.
   - Past the max hold with others waiting, `run` stops renewing and warns. By default the ssh command keeps running, and the warning says when the next in line gets the Jetson. Split such jobs, or set `JETSON_LOCK_KILL_ON_PREEMPT=1` so the command is stopped before then (`run` then exits 5).
 - **When the grace starts.** The old script let a waiter break the lock as soon as `now - since > MAX_HOLD + GRACE`. If the first waiter arrived after that point, it broke the lock at once, with no warning to the holder. hwlock evicts at `max(since + max hold, arrival of the oldest waiter) + grace`, so the holder always gets the full grace once someone waits. If the waiter was already queued before `since + max hold`, both give the same deadline.
