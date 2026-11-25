@@ -3,6 +3,8 @@
 import threading
 import time
 
+import pytest
+
 from conftest import wait_for
 
 
@@ -236,3 +238,80 @@ def test_peer_check_works_for_high_file_descriptors():
         for f in pad:
             f.close()
         resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+
+GUARD = {"HWLOCK_RESOURCE_MAX_HOLD_S": "jetson=2", "HWLOCK_RESOURCE_HOLD_GRACE_S": "jetson=2"}
+
+
+def test_renew_over_max_hold_is_409_with_the_deadline_and_shown_in_status(make_server):
+    srv = make_server(HWLOCK_MAX_HOLD_S="0", **GUARD)
+    api = srv.api
+    assert api.acquire("jetson", "hog", lease=60)[0] == 200
+    assert api.acquire("gpu", "free-rider", lease=60)[0] == 200
+    st, out = api.acquire("jetson", "next", wait=0)
+    assert st == 202
+    g = api.status("jetson")["holder"]["guard"]
+    assert g["max_hold_s"] == 2 and g["grace_s"] == 2 and g["waiting"] == 1 and 0 < g["refuse_in_s"] <= 2
+    assert api.status("gpu")["holder"]["guard"] is None  # global 0: only jetson is guarded
+    page = api.get("/")[1]
+    assert "max hold 2s" in page and "evicted in" in page
+    time.sleep(2.2)
+    st, err = api.post("/r/jetson/renew", {"owner": "hog"})
+    assert st == 409 and err["error"] == "over_max_hold", err
+    assert err["waiting"] == 1 and err["max_hold_s"] == 2 and err["grace_s"] == 2 and 0 < err["evict_in_s"] <= 2
+    assert "renew refused" in api.get("/")[1]
+    st, err = api.acquire("jetson", "hog")  # a re-acquire is refused the same way
+    assert st == 409 and err["error"] == "over_max_hold"
+    # nobody keeps asking for "next" here, but its ticket is alive (heartbeat 120 s): eviction at since + 4 s
+    wait_for(lambda: api.status("jetson")["holder"] is None, timeout=5)
+    ev = api.events("jetson", {"renew_refused", "evict_max_hold"})
+    assert [e["kind"] for e in ev] == ["renew_refused", "renew_refused", "evict_max_hold"]
+    assert ev[-1]["owner"] == "hog" and 4 <= ev[-1]["detail"]["held_s"] < 5
+    assert api.acquire("jetson", "next", ticket=out["ticket"], wait=0)[0] == 200
+
+
+def test_acquire_max_hold_over_http(make_server):
+    api = make_server(HWLOCK_MAX_HOLD_S="600").api
+    st, out = api.acquire("jetson", "a", max_hold=60)
+    assert st == 200 and out["holder"]["guard"]["max_hold_s"] == 60
+    assert api.acquire("gpu", "b", max_hold=10**9)[1]["holder"]["guard"]["max_hold_s"] == 600
+    for bad in (0, -1, "soon", True):
+        st, err = api.acquire("rig", "c", max_hold=bad)
+        assert st == 400 and "max_hold" in err["message"], err
+
+
+def test_guard_since_survives_a_restart(make_server):
+    srv = make_server(HWLOCK_MAX_HOLD_S="0", HWLOCK_RESOURCE_MAX_HOLD_S="jetson=3",
+                      HWLOCK_RESOURCE_HOLD_GRACE_S="jetson=2")
+    api = srv.api
+    api.acquire("jetson", "hog", lease=60)
+    ticket = api.acquire("jetson", "next", wait=0)[1]["ticket"]
+    before = api.status("jetson")["holder"]
+    srv.kill()
+    time.sleep(1.5)
+    srv.start()
+    after = api.status("jetson")["holder"]
+    assert after["since"] == before["since"] and after["guard"]["evict_at"] == before["guard"]["evict_at"]
+    assert after["held_s"] >= 1.5
+    t0 = time.time()
+    st = 202
+    while st == 202 and time.time() - t0 < 10:
+        st, out = api.acquire("jetson", "next", ticket=ticket, wait=1)
+    assert st == 200, out
+    # evicted 3 + 2 s after it was taken, the restart not counting as a new start
+    evict = api.events("jetson", {"evict_max_hold"})
+    assert len(evict) == 1 and 5 <= evict[0]["detail"]["held_s"] < 6, evict
+
+
+def test_guard_config_parsing():
+    from hwlock_server.web import Config
+
+    c = Config(resource_max_hold_s=" jetson=7200, rig=0 ", resource_hold_grace_s="jetson=300")
+    assert c.max_hold_s == 7200 and c.hold_grace_s == 300  # defaults: jetson-lock's
+    assert c.resource_max_hold_s == {"jetson": 7200, "rig": 0} and c.resource_hold_grace_s == {"jetson": 300}
+    assert Config(max_hold_s=0).max_hold_s == 0
+    for bad in ("jetson", "jetson=", "bad name=5", "jetson=x"):
+        with pytest.raises(ValueError):
+            Config(resource_max_hold_s=bad)
+    with pytest.raises(ValueError):
+        Config(max_hold_s=-1)

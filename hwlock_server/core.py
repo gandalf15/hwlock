@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS resources (
     holder_ticket INTEGER,
     since         REAL,
     expires       REAL,
-    lease_s       REAL
+    lease_s       REAL,
+    holder_max_hold_s REAL
 );
 CREATE TABLE IF NOT EXISTS tickets (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -124,8 +125,10 @@ class Store:
         default_lease_s: float = 1800,
         max_lease_s: float = 86400,
         heartbeat_s: float = 120,
-        max_hold_s: float = 0,
+        max_hold_s: float = 7200,
         hold_grace_s: float = 300,
+        resource_max_hold_s: dict | None = None,
+        resource_hold_grace_s: dict | None = None,
         clock: Callable[[], float] = time.time,
         log: Callable[[str], None] | None = None,
     ):
@@ -136,8 +139,11 @@ class Store:
         self.heartbeat_s = heartbeat_s
         # Starvation guard (0 = off): while others wait, a holder may keep the lock at most max_hold_s
         # from when it took it; after that renew/re-acquire is refused, and hold_grace_s later it is evicted.
+        # Per-resource values (resource_*) override the global ones; see guard().
         self.max_hold_s = max_hold_s
         self.hold_grace_s = hold_grace_s
+        self.resource_max_hold_s = dict(resource_max_hold_s or {})
+        self.resource_hold_grace_s = dict(resource_hold_grace_s or {})
         self.clock = clock
         self.log = log
         self.lock = threading.RLock()
@@ -150,6 +156,10 @@ class Store:
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("PRAGMA busy_timeout=5000")
         self.db.executescript(SCHEMA)
+        # Databases from before the per-acquire max hold lack its column (ALTER is not idempotent).
+        cols = {c["name"] for c in self.db.execute("PRAGMA table_info(resources)")}
+        if "holder_max_hold_s" not in cols:
+            self.db.execute("ALTER TABLE resources ADD COLUMN holder_max_hold_s REAL")
         with self._tx() as now:
             # Waiting clients could not heartbeat while we were down: give them a fresh window to
             # re-attach by ticket id. Holders keep their absolute expiry (leases keep counting).
@@ -223,21 +233,12 @@ class Store:
         ).fetchall():
             self.db.execute(
                 "UPDATE resources SET holder_owner=NULL, holder_reason=NULL, holder_host=NULL,"
-                " holder_pid=NULL, holder_ticket=NULL, since=NULL, expires=NULL, lease_s=NULL"
+                " holder_pid=NULL, holder_ticket=NULL, since=NULL, expires=NULL, lease_s=NULL,"
+                " holder_max_hold_s=NULL"
                 " WHERE name=?", (r["name"],))
             self._event(now, r["name"], "expire", r["holder_owner"], r["holder_ticket"],
                         {"held_s": round(now - r["since"], 3), "overdue_s": round(now - r["expires"], 3)})
             changes += 1
-        if self.max_hold_s > 0:
-            for r in self.db.execute(
-                "SELECT * FROM resources WHERE holder_owner IS NOT NULL AND since <= ?"
-                " AND EXISTS (SELECT 1 FROM tickets WHERE tickets.resource = resources.name)",
-                (now - self.max_hold_s - self.hold_grace_s,),
-            ).fetchall():
-                self._clear(r["name"])
-                self._event(now, r["name"], "evict_max_hold", r["holder_owner"], r["holder_ticket"],
-                            {"held_s": round(now - r["since"], 3), "max_hold_s": self.max_hold_s})
-                changes += 1
         for t in self.db.execute(
             "SELECT * FROM tickets WHERE last_seen < ?", (now - self.heartbeat_s,)
         ).fetchall():
@@ -245,6 +246,18 @@ class Store:
             self._event(now, t["resource"], "drop", t["owner"], t["id"],
                         {"silent_s": round(now - t["last_seen"], 3)})
             changes += 1
+        # after dropping dead tickets: only live waiters can evict a holder
+        for r in self.db.execute(
+            "SELECT * FROM resources WHERE holder_owner IS NOT NULL"
+            " AND EXISTS (SELECT 1 FROM tickets WHERE tickets.resource = resources.name)"
+        ).fetchall():
+            g = self._guard(r, now)
+            if g and g["evict_at"] <= now:
+                self._clear(r["name"])
+                self._event(now, r["name"], "evict_max_hold", r["holder_owner"], r["holder_ticket"],
+                            {"held_s": round(now - r["since"], 3), "max_hold_s": g["max_hold_s"],
+                             "grace_s": g["grace_s"], "waiting": g["waiting"]})
+                changes += 1
         return changes
 
     def sweep(self) -> int:
@@ -259,20 +272,53 @@ class Store:
             "pid": r["holder_pid"], "ticket": r["holder_ticket"], "since": r["since"],
             "expires": r["expires"], "lease_s": r["lease_s"],
             "held_s": round(now - r["since"], 3), "lease_left_s": round(r["expires"] - now, 3),
+            "guard": self._guard(r, now),
         }
 
+    def limits(self, resource) -> tuple[float, float]:
+        """(max_hold_s, grace_s) configured for a resource; max_hold_s 0 = no guard."""
+        return (float(self.resource_max_hold_s.get(resource, self.max_hold_s)),
+                float(self.resource_hold_grace_s.get(resource, self.hold_grace_s)))
+
+    def _guard(self, r, now) -> dict | None:
+        """The starvation guard for the current holder of `r`, or None when it has no limit.
+
+        max_hold_s is the resource's limit, lowered by the holder's own `max_hold` from its acquire.
+        While tickets wait: renew/re-acquire is refused from refuse_at = since + max_hold_s, and the
+        holder is evicted at evict_at = max(refuse_at, oldest waiter's arrival) + grace_s (so a holder
+        that was alone past its max hold still gets the grace period once somebody starts waiting).
+        """
+        limit, grace = self.limits(r["name"])
+        own = r["holder_max_hold_s"]
+        if own:
+            limit = min(limit, own) if limit > 0 else own
+        if limit <= 0:
+            return None
+        g = {"max_hold_s": limit, "grace_s": grace}
+        q = self.db.execute("SELECT COUNT(*), MIN(created) FROM tickets WHERE resource=?",
+                            (r["name"],)).fetchone()
+        if q[0]:
+            refuse_at = r["since"] + limit
+            evict_at = max(refuse_at, q[1]) + grace
+            g.update(waiting=q[0], refuse_at=refuse_at, evict_at=evict_at,
+                     refuse_in_s=round(refuse_at - now, 3), evict_in_s=round(evict_at - now, 3))
+        return g
+
     def _check_max_hold(self, r, now):
-        """Refuse to extend a lock held longer than max_hold_s while others wait."""
-        if self.max_hold_s <= 0 or now - r["since"] <= self.max_hold_s:
+        """Refuse to extend a lock held longer than its max hold while others wait (logged)."""
+        g = self._guard(r, now)
+        if not g or "waiting" not in g or now - r["since"] <= g["max_hold_s"]:
             return
-        waiting = self.db.execute("SELECT COUNT(*) FROM tickets WHERE resource=?", (r["name"],)).fetchone()[0]
-        if waiting:
-            self._event(now, r["name"], "renew_refused", r["holder_owner"], r["holder_ticket"],
-                        {"held_s": round(now - r["since"], 3), "waiting": waiting})
-            raise OverMaxHold(
-                f"{r['holder_owner']} has held {r['name']} for {now - r['since']:.0f} s (> {self.max_hold_s:g} s)"
-                f" while {waiting} wait: renew refused, release it", waiting=waiting,
-                evict_in_s=round(r["since"] + self.max_hold_s + self.hold_grace_s - now, 3))
+        held = round(now - r["since"], 3)
+        self._event(now, r["name"], "renew_refused", r["holder_owner"], r["holder_ticket"],
+                    {"held_s": held, "max_hold_s": g["max_hold_s"], "waiting": g["waiting"],
+                     "evict_in_s": g["evict_in_s"]})
+        raise OverMaxHold(
+            f"{r['holder_owner']} has held {r['name']} for {held:.0f} s (max {g['max_hold_s']:g} s while"
+            f" others wait) and {g['waiting']} wait: renew refused; release it", resource=r["name"],
+            waiting=g["waiting"], held_s=held, max_hold_s=g["max_hold_s"], grace_s=g["grace_s"],
+            evict_at=g["evict_at"], evict_in_s=g["evict_in_s"],
+            lease_left_s=round(r["expires"] - now, 3))
 
     def _position(self, resource, ticket_id) -> int:
         return self.db.execute(
@@ -280,8 +326,22 @@ class Store:
         ).fetchone()[0]
 
     # ------------------------------------------------------------------ operations
+    def _max_hold(self, value: Any) -> float | None:
+        """A holder's own max hold (acquire `max_hold`): seconds > 0; capped by the resource's limit."""
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise BadRequest(f"max_hold must be a number of seconds: {value!r}")
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            raise BadRequest(f"max_hold must be a number of seconds: {value!r}") from None
+        if not (v >= 1) or v == float("inf"):
+            raise BadRequest("max_hold must be at least 1 s (leave it out for the server's limit)")
+        return v
+
     def acquire_step(self, resource, owner, *, reason=None, host=None, pid=None, lease_s=None,
-                     ticket=None, may_grant: Callable[[], bool] = lambda: True) -> dict:
+                     ticket=None, max_hold_s=None, may_grant: Callable[[], bool] = lambda: True) -> dict:
         """One non-blocking acquire attempt. Creates a ticket when `ticket` is None.
 
         Returns {"state": "acquired", ...} or {"state": "waiting", "ticket", "position", "holder"};
@@ -292,6 +352,7 @@ class Store:
         _name(owner, "owner")
         lease = self._lease(lease_s)
         reason, host, pid = _text(reason), _text(host), _pid(pid)
+        max_hold = self._max_hold(max_hold_s)
         if ticket is not None:
             try:
                 ticket = int(ticket)
@@ -301,7 +362,8 @@ class Store:
             self._sweep(now)
             r = self._resource(now, resource)
             if r["holder_owner"] == owner:
-                # Idempotent re-acquire by the holder: keep holding, refresh the lease.
+                # Idempotent re-acquire by the holder: keep holding, refresh the lease. Its `since` and
+                # max hold stay as they were (a re-acquire cannot reset or raise the guard).
                 self._check_max_hold(r, now)
                 if ticket is not None and ticket != r["holder_ticket"]:
                     self.db.execute("DELETE FROM tickets WHERE id=? AND resource=? AND owner=?",
@@ -338,11 +400,13 @@ class Store:
                 self.db.execute("DELETE FROM tickets WHERE id=?", (ticket,))
                 self.db.execute(
                     "UPDATE resources SET holder_owner=?, holder_reason=?, holder_host=?, holder_pid=?,"
-                    " holder_ticket=?, since=?, expires=?, lease_s=? WHERE name=?",
-                    (owner, t["reason"], t["host"], t["pid"], ticket, now, now + lease, lease, resource))
+                    " holder_ticket=?, since=?, expires=?, lease_s=?, holder_max_hold_s=? WHERE name=?",
+                    (owner, t["reason"], t["host"], t["pid"], ticket, now, now + lease, lease, max_hold,
+                     resource))
                 self._event(now, resource, "acquire", owner, ticket,
                             {"waited_s": round(now - t["created"], 3), "lease_s": lease,
-                             "reason": t["reason"], "host": t["host"], "pid": t["pid"]})
+                             "reason": t["reason"], "host": t["host"], "pid": t["pid"],
+                             **({"max_hold_s": max_hold} if max_hold else {})})
                 r = self._resource(now, resource)
                 return {"state": "acquired", "resource": resource, "ticket": ticket,
                         "reacquired": False, "holder": self._holder(r, now)}
@@ -415,7 +479,8 @@ class Store:
     def _clear(self, resource):
         self.db.execute(
             "UPDATE resources SET holder_owner=NULL, holder_reason=NULL, holder_host=NULL,"
-            " holder_pid=NULL, holder_ticket=NULL, since=NULL, expires=NULL, lease_s=NULL"
+            " holder_pid=NULL, holder_ticket=NULL, since=NULL, expires=NULL, lease_s=NULL,"
+                " holder_max_hold_s=NULL"
             " WHERE name=?", (resource,))
 
     def release(self, resource, owner) -> dict:

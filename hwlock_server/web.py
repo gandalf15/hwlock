@@ -5,9 +5,9 @@ Routes (JSON in/out; all except /health need `Authorization: Bearer $HWLOCK_TOKE
   GET  /                                       auto-refreshing HTML status page (token via ?token=...)
   GET  /status[?resource=R]  or /status/R      holders, leases, queues
   GET  /events[?resource=R&after=ID&limit=N]   audit log
-  POST /r/<resource>/acquire        {owner, reason?, host?, pid?, lease?, ticket?, wait?}
+  POST /r/<resource>/acquire        {owner, reason?, host?, pid?, lease?, max_hold?, ticket?, wait?}
          200 acquired | 202 waiting (long-polls up to `wait` s, capped by the server) | 410 ticket gone
-  POST /r/<resource>/renew          {owner, lease?}           200 | 409 not holder / over_max_hold
+  POST /r/<resource>/renew          {owner, lease?}           200 | 409 not_holder / over_max_hold
   POST /r/<resource>/release        {owner}                   200 | 409 not holder
   POST /r/<resource>/cancel         {ticket, owner?}          200 (also releases if that ticket was granted)
   POST /r/<resource>/force-release  {by, reason?}             200 | 409 not held  (admin; logged)
@@ -28,7 +28,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from . import __version__
-from .core import BadRequest, HwlockError, Store
+from .core import NAME_RE, BadRequest, HwlockError, Store
 
 
 class Config:
@@ -43,12 +43,38 @@ class Config:
         self.max_lease_s = float(kw.get("max_lease_s") or env("HWLOCK_MAX_LEASE_S", "86400"))
         self.heartbeat_s = float(kw.get("heartbeat_s") or env("HWLOCK_HEARTBEAT_S", "120"))
         self.poll_s = float(kw.get("poll_s") or env("HWLOCK_POLL_S", "25"))
-        self.max_hold_s = float(kw.get("max_hold_s") or env("HWLOCK_MAX_HOLD_S", "0"))
-        self.hold_grace_s = float(kw.get("hold_grace_s") or env("HWLOCK_HOLD_GRACE_S", "300"))
+        # starvation guard; per-resource values as "jetson=7200,rig=0" override the global ones
+        self.max_hold_s = float(kw["max_hold_s"] if "max_hold_s" in kw else env("HWLOCK_MAX_HOLD_S") or "7200")
+        self.hold_grace_s = float(kw["hold_grace_s"] if "hold_grace_s" in kw
+                                  else env("HWLOCK_HOLD_GRACE_S") or "300")
+        self.resource_max_hold_s = _per_resource(kw.get("resource_max_hold_s")
+                                                 or env("HWLOCK_RESOURCE_MAX_HOLD_S", ""), "HWLOCK_RESOURCE_MAX_HOLD_S")
+        self.resource_hold_grace_s = _per_resource(kw.get("resource_hold_grace_s")
+                                                   or env("HWLOCK_RESOURCE_HOLD_GRACE_S", ""),
+                                                   "HWLOCK_RESOURCE_HOLD_GRACE_S")
+        if min([self.max_hold_s, self.hold_grace_s, *self.resource_max_hold_s.values(),
+                *self.resource_hold_grace_s.values()]) < 0:
+            raise ValueError("max hold and grace must be >= 0 (max hold 0 = no starvation guard)")
         self.sweep_s = float(kw.get("sweep_s") or env("HWLOCK_SWEEP_S", "1"))
         if self.heartbeat_s < self.poll_s + 5:
             raise ValueError("HWLOCK_HEARTBEAT_S must be at least HWLOCK_POLL_S + 5 so a long-polling"
                              " waiter is never dropped")
+
+
+def _per_resource(spec, what: str) -> dict:
+    """"jetson=7200, rig=0" -> {"jetson": 7200.0, "rig": 0.0} (a dict passes through)."""
+    if isinstance(spec, dict):
+        return {k: float(v) for k, v in spec.items()}
+    out = {}
+    for item in filter(None, (x.strip() for x in str(spec).split(","))):
+        name, sep, val = item.partition("=")
+        try:
+            if not sep or not NAME_RE.match(name.strip()):
+                raise ValueError
+            out[name.strip()] = float(val)
+        except ValueError:
+            raise ValueError(f"{what}: expected resource=seconds[,resource=seconds...], got {item!r}") from None
+    return out
 
 
 def _peer_alive(sock: socket.socket) -> bool:
@@ -92,6 +118,19 @@ def _fmt_s(s) -> str:
     return f"{s}s"
 
 
+def _guard_html(g) -> str:
+    """Max-hold line for the holder: the limit, and the deadlines while people wait."""
+    if not g:
+        return ""
+    if "evict_in_s" not in g:
+        return f" · max hold {_fmt_s(g['max_hold_s'])} once others wait"
+    refuse = ("renew refused now" if g["refuse_in_s"] <= 0 else f"renew refused in {_fmt_s(g['refuse_in_s'])}")
+    cls = " class=warn" if g["refuse_in_s"] <= 0 else ""
+    return (f"<br><span{cls}>max hold {_fmt_s(g['max_hold_s'])}: {refuse} · evicted in"
+            f" {_fmt_s(max(0, g['evict_in_s']))}"
+            f" ({time.strftime('%H:%M:%S', time.localtime(g['evict_at']))})</span>")
+
+
 def render_html(status: dict, token_qs: str) -> str:
     e = html.escape
     rows = []
@@ -100,7 +139,7 @@ def render_html(status: dict, token_qs: str) -> str:
         holder = ("<span class=free>free</span>" if h is None else
                   f"<b>{e(h['owner'])}</b> {e(h['reason'] or '')}<br><small>{e(h['host'] or '')}"
                   f" pid {e(str(h['pid'] or '-'))} · held {_fmt_s(h['held_s'])} ·"
-                  f" lease left {_fmt_s(h['lease_left_s'])}</small>")
+                  f" lease left {_fmt_s(h['lease_left_s'])}{_guard_html(h.get('guard'))}</small>")
         queue = "".join(
             f"<li>{q['position']}. <b>{e(q['owner'])}</b> {e(q['reason'] or '')}"
             f" <small>waiting {_fmt_s(q['waiting_s'])} · ticket {q['ticket']}</small></li>"
@@ -110,11 +149,11 @@ def render_html(status: dict, token_qs: str) -> str:
     return f"""<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width, initial-scale=1"><meta http-equiv=refresh content=3>
 <title>hwlock</title><style>
-:root{{--bg:#fff;--fg:#1d1d1f;--muted:#888;--line:#ddd;--ok:#1a7f37}}
-@media (prefers-color-scheme: dark){{:root{{--bg:#141414;--fg:#eee;--muted:#999;--line:#333;--ok:#4ac26b}}}}
+:root{{--bg:#fff;--fg:#1d1d1f;--muted:#888;--line:#ddd;--ok:#1a7f37;--warn:#b35900}}
+@media (prefers-color-scheme: dark){{:root{{--bg:#141414;--fg:#eee;--muted:#999;--line:#333;--ok:#4ac26b;--warn:#f0a050}}}}
 body{{background:var(--bg);color:var(--fg);font:15px/1.4 system-ui,sans-serif;margin:0;padding:16px}}
 table{{border-collapse:collapse;width:100%}}td,th{{border-bottom:1px solid var(--line);padding:8px;
-text-align:left;vertical-align:top}}ol{{margin:0;padding:0;list-style:none}}.free{{color:var(--ok)}}
+text-align:left;vertical-align:top}}ol{{margin:0;padding:0;list-style:none}}.free{{color:var(--ok)}}.warn{{color:var(--warn)}}
 .muted,small{{color:var(--muted)}}a{{color:inherit}}</style></head><body>
 <h1>hwlock</h1><table><tr><th>resource</th><th>holder</th><th>queue</th></tr>{body}</table>
 <p class=muted>server time {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(status['now']))} ·
@@ -209,6 +248,7 @@ class Handler(BaseHTTPRequestHandler):
                     sock = self.connection
                     out = store.acquire(res, b.get("owner"), reason=b.get("reason"), host=b.get("host"),
                                         pid=b.get("pid"), lease_s=b.get("lease"), ticket=b.get("ticket"),
+                                        max_hold_s=b.get("max_hold"),
                                         wait_s=wait, may_grant=lambda: _peer_alive(sock))
                     if out["state"] == "abandoned":
                         self.close_connection = True
@@ -244,7 +284,8 @@ class App:
         os.makedirs(os.path.dirname(os.path.abspath(cfg.db)), exist_ok=True)
         self.store = Store(cfg.db, default_lease_s=cfg.default_lease_s, max_lease_s=cfg.max_lease_s,
                            heartbeat_s=cfg.heartbeat_s, max_hold_s=cfg.max_hold_s,
-                           hold_grace_s=cfg.hold_grace_s,
+                           hold_grace_s=cfg.hold_grace_s, resource_max_hold_s=cfg.resource_max_hold_s,
+                           resource_hold_grace_s=cfg.resource_hold_grace_s,
                            log=lambda m: print(f"hwlock: {m}", flush=True))
         self.httpd = Server((cfg.host, cfg.port), Handler)
         self.httpd.app = self  # type: ignore[attr-defined]
@@ -260,7 +301,10 @@ class App:
     def serve_forever(self):
         threading.Thread(target=self._sweeper, name="sweeper", daemon=True).start()
         print(f"hwlock {__version__} listening on http://{self.cfg.host}:{self.httpd.server_address[1]}"
-              f" db={self.cfg.db} auth={'token' if self.cfg.token else 'none'}", flush=True)
+              f" db={self.cfg.db} auth={'token' if self.cfg.token else 'none'}"
+              f" max_hold={self.cfg.max_hold_s:g}s grace={self.cfg.hold_grace_s:g}s"
+              + "".join(f" {k}:max_hold={v:g}s" for k, v in self.cfg.resource_max_hold_s.items())
+              + "".join(f" {k}:grace={v:g}s" for k, v in self.cfg.resource_hold_grace_s.items()), flush=True)
         try:
             self.httpd.serve_forever()
         finally:

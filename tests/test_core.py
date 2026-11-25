@@ -248,32 +248,192 @@ def test_long_poll_drops_ticket_when_client_hangs_up_before_its_turn(store):
 
 
 def test_starvation_guard_refuses_renew_then_evicts_while_others_wait(tmp_path, clock):
-    s = Store(str(tmp_path / "g.db"), default_lease_s=100, max_lease_s=1000, heartbeat_s=10_000,
+    s = Store(str(tmp_path / "g.db"), default_lease_s=200, max_lease_s=1000, heartbeat_s=10_000,
               max_hold_s=500, hold_grace_s=50, clock=clock)
     s.acquire_step("gpu", "hog")
-    for _ in range(6):  # nobody waiting: no limit
+    clock.advance(90)
+    s.renew("gpu", "hog")
+    t = s.acquire_step("gpu", "next")["ticket"]  # waits from t=90, before the max hold
+    for _ in range(4):
         clock.advance(90)
-        s.renew("gpu", "hog")
-    assert s.status("gpu")["holder"]["owner"] == "hog"  # held 540 s > 500 s, still fine
-    t = s.acquire_step("gpu", "next")["ticket"]
+        s.renew("gpu", "hog")  # held 450 s <= 500 s: fine although someone waits
+    clock.advance(90)  # held 540 s
     with pytest.raises(OverMaxHold) as e:
         s.renew("gpu", "hog")
-    assert e.value.extra["waiting"] == 1
+    assert e.value.status == 409 and e.value.code == "over_max_hold"
+    x = e.value.extra
+    assert (x["waiting"], x["max_hold_s"], x["grace_s"], x["held_s"]) == (1, 500, 50, 540)
+    assert x["evict_in_s"] == 10  # since + 500 + 50
     with pytest.raises(OverMaxHold):
         s.acquire_step("gpu", "hog")  # re-acquire is a renewal too
     assert kinds(s)[-1] == "renew_refused"  # the refusal is logged (not rolled back)
-    clock.advance(5)  # held 545 s < 500 + 50: not evicted yet
+    clock.advance(5)  # held 545 s < 550 s: not evicted yet
     assert s.acquire_step("gpu", "next", ticket=t)["state"] == "waiting"
-    clock.advance(10)  # held 555 s > 550 s
+    clock.advance(6)  # held 551 s
     assert s.acquire_step("gpu", "next", ticket=t)["state"] == "acquired"
-    assert "evict_max_hold" in kinds(s)
+    ev = s.events("gpu", limit=1000)["events"]
+    evict = [e for e in ev if e["kind"] == "evict_max_hold"]
+    assert len(evict) == 1 and evict[0]["owner"] == "hog" and evict[0]["detail"]["held_s"] == 551
     s.close()
 
 
-def test_starvation_guard_off_by_default(store, clock):
-    store.acquire_step("gpu", "hog")
-    store.acquire_step("gpu", "next")
-    for _ in range(100):
+def test_holder_alone_past_max_hold_still_gets_the_grace_once_someone_waits(tmp_path, clock):
+    s = Store(str(tmp_path / "g.db"), default_lease_s=100, max_lease_s=1000, heartbeat_s=10_000,
+              max_hold_s=500, hold_grace_s=50, clock=clock)
+    s.acquire_step("gpu", "hog")
+    for _ in range(10):  # nobody waiting: no limit
         clock.advance(90)
-        store.renew("gpu", "hog")
-    assert store.status("gpu")["holder"]["owner"] == "hog"
+        s.renew("gpu", "hog")
+    assert s.status("gpu")["holder"]["owner"] == "hog"  # held 900 s > 500 s, still fine
+    t = s.acquire_step("gpu", "next")["ticket"]  # arrives at 900 s
+    g = s.status("gpu")["holder"]["guard"]
+    assert g["refuse_in_s"] == -400 and g["evict_in_s"] == 50  # from the waiter's arrival, not since + 550
+    with pytest.raises(OverMaxHold):
+        s.renew("gpu", "hog")
+    clock.advance(49)
+    assert s.acquire_step("gpu", "next", ticket=t)["state"] == "waiting"
+    clock.advance(2)
+    assert s.acquire_step("gpu", "next", ticket=t)["state"] == "acquired"
+    s.close()
+
+
+def blind_renewer_vs_waiter(s, clock, step=60, until=20_000):
+    """A holder that renews blindly every `step` s while a live waiter keeps asking.
+    Returns (time the waiter got it, first refusal time) relative to the holder's acquire."""
+    s.acquire_step("jetson", "proxy-hold")
+    t0 = clock()
+    clock.advance(10)
+    ticket = s.acquire_step("jetson", "job")["ticket"]
+    refused = None
+    while clock() - t0 < until:
+        clock.advance(step)
+        try:
+            s.renew("jetson", "proxy-hold")
+        except OverMaxHold:
+            refused = refused or clock() - t0
+        except NotHolder:
+            pass
+        if s.acquire_step("jetson", "job", ticket=ticket)["state"] == "acquired":
+            return clock() - t0, refused
+    return None, refused
+
+
+def test_guard_is_on_by_default_2h_plus_300s_against_a_blind_renewer(tmp_path, clock):
+    """The incident: an idle proxy hold renewing blindly while a job waits. Defaults are the
+    jetson-lock ones (7200 s max hold, 300 s grace); the waiter keeps heartbeating."""
+    s = Store(str(tmp_path / "d.db"), clock=clock)
+    got, refused = blind_renewer_vs_waiter(s, clock)
+    assert refused is not None and 7200 < refused <= 7200 + 60
+    assert got is not None and 7200 + 300 < got <= 7200 + 300 + 60
+    assert "evict_max_hold" in kinds(s, "jetson")
+    s.close()
+
+
+def test_no_waiter_means_no_limit(tmp_path, clock):
+    s = Store(str(tmp_path / "n.db"), max_hold_s=500, hold_grace_s=50, clock=clock)
+    s.acquire_step("gpu", "hog")
+    for _ in range(300):  # 30000 s, 60x the max hold
+        clock.advance(100)
+        s.renew("gpu", "hog")
+        s.sweep()
+    h = s.status("gpu")["holder"]
+    assert h["owner"] == "hog" and h["guard"] == {"max_hold_s": 500, "grace_s": 50}
+    assert "renew_refused" not in kinds(s) and "evict_max_hold" not in kinds(s)
+    s.close()
+
+
+def test_max_hold_0_turns_the_guard_off(tmp_path, clock):
+    s = Store(str(tmp_path / "o.db"), max_hold_s=0, heartbeat_s=10_000, clock=clock)
+    assert blind_renewer_vs_waiter(s, clock) == (None, None)
+    assert s.status("jetson")["holder"]["guard"] is None
+    s.close()
+
+
+def test_a_dead_waiter_does_not_evict(tmp_path, clock):
+    s = Store(str(tmp_path / "w.db"), max_hold_s=100, hold_grace_s=10, heartbeat_s=60, clock=clock)
+    s.acquire_step("gpu", "hog")
+    s.acquire_step("gpu", "ghost")  # never asks again
+    for _ in range(10):
+        clock.advance(30)
+        s.renew("gpu", "hog")
+    assert s.status("gpu")["holder"]["owner"] == "hog"
+    assert "drop" in kinds(s) and "evict_max_hold" not in kinds(s)
+    s.close()
+
+
+def test_per_resource_limits_override_the_global_ones(tmp_path, clock):
+    s = Store(str(tmp_path / "r.db"), max_hold_s=0, hold_grace_s=300, heartbeat_s=10_000, clock=clock,
+              resource_max_hold_s={"jetson": 100}, resource_hold_grace_s={"jetson": 20})
+    got, refused = blind_renewer_vs_waiter(s, clock, step=10, until=1000)
+    assert 100 < refused <= 110 and 120 <= got <= 130
+    s.acquire_step("gpu", "hog")
+    assert s.status("gpu")["holder"]["guard"] is None  # global 0: gpu unguarded
+    assert s.limits("jetson") == (100, 20) and s.limits("gpu") == (0, 300)
+    s.close()
+
+
+def test_acquire_max_hold_lowers_the_limit_and_is_capped_by_the_server(tmp_path, clock):
+    s = Store(str(tmp_path / "m.db"), max_hold_s=500, hold_grace_s=50, heartbeat_s=10_000, clock=clock)
+    out = s.acquire_step("a", "short", max_hold_s=60)
+    assert out["holder"]["guard"]["max_hold_s"] == 60
+    s.acquire_step("b", "greedy", max_hold_s=99_999)
+    assert s.status("b")["holder"]["guard"]["max_hold_s"] == 500  # capped by the server
+    for bad in (0, -5, "x", True, float("nan"), float("inf")):
+        with pytest.raises(BadRequest):
+            s.acquire_step("c", "bad", max_hold_s=bad)
+    # a re-acquire cannot raise or reset it
+    s.acquire_step("a", "short", max_hold_s=400)
+    assert s.status("a")["holder"]["guard"]["max_hold_s"] == 60
+    t = s.acquire_step("a", "next")["ticket"]
+    clock.advance(61)
+    with pytest.raises(OverMaxHold):
+        s.renew("a", "short")
+    clock.advance(50)
+    assert s.acquire_step("a", "next", ticket=t)["state"] == "acquired"
+    assert s.status("a")["holder"]["guard"]["max_hold_s"] == 500  # the next holder has the server's
+    s.close()
+    # no server limit: a holder may still volunteer one
+    s = Store(str(tmp_path / "m0.db"), max_hold_s=0, clock=clock)
+    assert s.acquire_step("a", "polite", max_hold_s=30)["holder"]["guard"]["max_hold_s"] == 30
+    s.close()
+
+
+def test_since_and_the_guard_survive_a_restart(tmp_path, clock):
+    path = str(tmp_path / "p.db")
+    s = Store(path, max_hold_s=500, hold_grace_s=50, heartbeat_s=1000, clock=clock)
+    s.acquire_step("gpu", "hog", max_hold_s=300)
+    since = s.status("gpu")["holder"]["since"]
+    clock.advance(100)
+    t = s.acquire_step("gpu", "next")["ticket"]
+    s.close()
+    clock.advance(150)  # down for a while
+    s = Store(path, max_hold_s=500, hold_grace_s=50, heartbeat_s=1000, clock=clock)
+    h = s.status("gpu")["holder"]
+    assert h["since"] == since and h["held_s"] == 250 and h["guard"]["max_hold_s"] == 300
+    assert h["guard"]["evict_at"] == since + 300 + 50
+    clock.advance(51)  # held 301 s
+    with pytest.raises(OverMaxHold):
+        s.renew("gpu", "hog")
+    clock.advance(50)  # held 351 s
+    assert s.acquire_step("gpu", "next", ticket=t)["state"] == "acquired"
+    s.close()
+
+
+def test_old_database_gets_the_new_column(tmp_path, clock):
+    import sqlite3
+
+    from hwlock_server import core
+
+    path = str(tmp_path / "old.db")
+    db = sqlite3.connect(path)
+    db.executescript(core.SCHEMA.replace(",\n    holder_max_hold_s REAL", ""))
+    db.execute("INSERT INTO resources(name, created, holder_owner, holder_ticket, since, expires, lease_s)"
+               " VALUES ('gpu', ?, 'hog', 1, ?, ?, 100)", (clock(), clock() - 10, clock() + 90))
+    db.commit()
+    assert "holder_max_hold_s" not in {r[1] for r in db.execute("PRAGMA table_info(resources)")}
+    db.close()
+    for _ in range(2):  # idempotent
+        s = Store(path, max_hold_s=500, clock=clock)
+        h = s.status("gpu")["holder"]
+        assert h["owner"] == "hog" and h["held_s"] == 10 and h["guard"]["max_hold_s"] == 500
+        s.close()
