@@ -1,0 +1,24 @@
+# hwlock server. Default: reachable only from this machine (127.0.0.1:8770).
+# LAN:   HWLOCK_BIND=0.0.0.0 docker compose up -d     (set HWLOCK_TOKEN too!)
+# Settings can also live in a .env file next to this file (never commit it).
+name: hwlock
+services:
+  hwlock:
+    build: .
+    image: hwlock:latest
+    restart: unless-stopped
+    ports:
+      - "${HWLOCK_BIND:-127.0.0.1}:${HWLOCK_PUBLISH_PORT:-8770}:8770"
+    environment:
+      HWLOCK_TOKEN: ${HWLOCK_TOKEN:-}
+      HWLOCK_ADMIN_TOKEN: ${HWLOCK_ADMIN_TOKEN:-}
+      HWLOCK_DEFAULT_LEASE_S: ${HWLOCK_DEFAULT_LEASE_S:-1800}
+      HWLOCK_MAX_LEASE_S: ${HWLOCK_MAX_LEASE_S:-86400}
+      HWLOCK_HEARTBEAT_S: ${HWLOCK_HEARTBEAT_S:-120}
+      HWLOCK_POLL_S: ${HWLOCK_POLL_S:-25}
+      TZ: ${TZ:-Etc/UTC}
+    volumes:
+      - hwlock-data:/data
+    stop_grace_period: 5s
+volumes:
+  hwlock-data:

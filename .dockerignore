@@ -1,0 +1,4 @@
+*
+!hwlock_server/
+!client/hwlock
+**/__pycache__
