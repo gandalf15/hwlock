@@ -208,13 +208,15 @@ file (3.7 or later, standard library only), no secrets, no writes, no commands r
 `/var/lib/nvpmodel`), and `psi_mem_*_avg10` where the kernel has pressure stall information.
 
 ```bash
-exporter/install.sh --ssh marcel@192.168.0.99            # or run exporter/install.sh on the box itself
-exporter/install.sh --ssh user@box --allow 192.168.0.0/24  # answer only the LAN (others get 403)
+exporter/install.sh --ssh marcel@192.168.0.99 --allow 192.168.0.0/24,127.0.0.0/8   # LAN + loopback only
+exporter/install.sh                                       # on the box itself, answering everyone who reaches it
 exporter/uninstall.sh --ssh marcel@192.168.0.99
 ```
 
 The installer puts it in `~/.local/bin`, writes the systemd `--user` unit `hwlock-exporter` (port 8771, all interfaces,
-`Restart=always`), starts it and checks it answers. A user unit runs while the user's systemd instance does: from boot
+`Restart=always`; binding to one LAN address could fail at boot before the network is up, so limit who may read it with
+`--allow` instead: other clients, for example over a VPN or a Docker bridge, get 403; keep `127.0.0.0/8` for the
+installer's own check), starts it and checks it answers. A user unit runs while the user's systemd instance does: from boot
 with lingering (`loginctl enable-linger`) or a desktop autologin (the Jetson has one), otherwise only after a login.
 Check it with `curl http://<box>:8771/`, logs with `journalctl --user -u hwlock-exporter`.
 

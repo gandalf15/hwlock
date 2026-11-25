@@ -212,8 +212,10 @@ the hwlock server, and `hwlock watch jetson` needs no hwlock lock.
 - `hwlock-exporter` runs on the Jetson as the systemd `--user` unit `hwlock-exporter` (port 8771, read-only JSON:
   boot id, memory, load, temperatures, GPU load, power mode). The GNOME autologin (`AutomaticLogin=marcel`) starts the
   user manager at boot, like `andrea-docker`, so the exporter is back after a reboot without lingering. It runs next to
-  Andrea and loads nothing; it uses about 15 MB.
-  Reinstall or remove it from the PC, under the Jetson lock: `exporter/install.sh --ssh marcel@192.168.0.99`,
+  Andrea and loads nothing; it uses about 20 MB (19 MB RSS measured after the install on 2026-11-25).
+  It answers only the LAN and loopback (`--allow 192.168.0.0/24,127.0.0.0/8`; Tailscale and Docker bridges get 403).
+  Reinstall or remove it from the PC, under the Jetson lock:
+  `exporter/install.sh --ssh marcel@192.168.0.99 --allow 192.168.0.0/24,127.0.0.0/8`,
   `exporter/uninstall.sh --ssh marcel@192.168.0.99`.
 - The live server probes resource `jetson` with `config/health.json` (gitignored; `.env` has
   `HWLOCK_HEALTH_CONFIG=/config/health.json`):
