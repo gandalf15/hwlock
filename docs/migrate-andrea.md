@@ -70,6 +70,7 @@ esac
 - The variables `JETSON_HOST`, `JETSON_LOCK_LEASE_S` and `JETSON_LOCK_MAX_WAIT_S` (0 means wait forever). `JETSON_LOCK_POLL_S` is no longer used: clients long-poll instead.
 - The owner format `[A-Za-z0-9._-]{1,64}`, the FIFO order, the 30-minute lease, and the 120 s window after which a waiting ticket that stopped refreshing is dropped.
 - `renew` and `release` print `NOT_HOLDER holder=<owner>` and exit 1 when you are not the holder. A successful `release` prints `RELEASED` and exits 0.
+- The **starvation guard**, but only once the server is configured for it (it is off by default in hwlock): set `HWLOCK_MAX_HOLD_S=7200` and `HWLOCK_HOLD_GRACE_S=300` in `~/code/hwlock/.env` (step 0 of section 3). Then, as before, while others wait a holder may keep the lock at most 2 h from when it took it: `renew` (and re-`acquire`) prints `OVER_MAX_HOLD waiting=N` and exits 1, and 300 s later the holder is evicted (`evict_max_hold` event) and the next in line gets the lock. Nobody waiting = no limit. One difference: `run` renews automatically, so a `run` past 2 h with others waiting prints a warning and loses the lock 300 s later while its ssh command keeps running. Split such jobs, or tell the user.
 
 ### What changes (all improvements; nobody relies on the old behaviour)
 
@@ -99,7 +100,7 @@ The Jetson cannot reach `127.0.0.1:8770` on the PC. There are two ways to fix th
    ```bash
    cd ~/code/hwlock
    # 0.0.0.0, not the LAN IP: publishing on one IP stops answering on 127.0.0.1 (the PC's own clients).
-   printf 'HWLOCK_TOKEN=%s\nHWLOCK_BIND=0.0.0.0\n' "$(openssl rand -hex 16)" > .env   # .env is gitignored
+   printf 'HWLOCK_TOKEN=%s\nHWLOCK_BIND=0.0.0.0\n' "$(openssl rand -hex 16)" >> .env   # .env is gitignored
    docker compose up -d
    mkdir -p ~/.config/hwlock && printf 'url=http://127.0.0.1:8770\ntoken=%s\n' "$(sed -n 's/^HWLOCK_TOKEN=//p' .env)" > ~/.config/hwlock/config
    chmod 600 .env ~/.config/hwlock/config
@@ -132,7 +133,12 @@ Running jobs execute the old script's code. bash reads a script while it runs it
 
 ```bash
 cd ~/code/andrea_ai
-# 0. hwlock is up and the 'jetson' resource is free in it
+# 0. hwlock runs with jetson-lock's starvation guard (2 h max hold while others wait, 300 s grace),
+#    is up, and the 'jetson' resource is free in it
+grep -q '^HWLOCK_MAX_HOLD_S=' ~/code/hwlock/.env 2>/dev/null ||
+  printf 'HWLOCK_MAX_HOLD_S=7200\nHWLOCK_HOLD_GRACE_S=300\n' >> ~/code/hwlock/.env
+(cd ~/code/hwlock && docker compose up -d)   # recreates the container only if the settings changed
+docker inspect hwlock-hwlock-1 --format '{{range .Config.Env}}{{println .}}{{end}}' | grep -E 'MAX_HOLD|GRACE'
 curl -fsS 127.0.0.1:8770/health && ~/code/hwlock/client/hwlock status jetson
 
 # 1. Wait until the OLD lock is idle: "holder: (free)" and an empty "queue:".

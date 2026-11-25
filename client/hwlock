@@ -130,6 +130,8 @@ def server_error_exit(err):
     p = err.payload or {}
     if err.status == 401:
         die("unauthorized: set HWLOCK_TOKEN to the server's token", EXIT_SERVER)
+    if err.status == 409 and p.get("error") == "over_max_hold":
+        die("%s (evicted in %s)" % (p.get("message"), fmt_s(p.get("evict_in_s"))), EXIT_NOT_HOLDER)
     if err.status == 409:
         die("%s (holder: %s)" % (p.get("message", "not the holder"), holder_text(p.get("holder"))),
             EXIT_NOT_HOLDER)
@@ -248,6 +250,7 @@ class Renewer(threading.Thread):
         self.lease_s = float(lease_s)
         self.stop_ev = threading.Event()
         self.lost = False
+        self.over = False
 
     def run(self):
         interval = max(0.2, self.lease_s / 3.0)
@@ -255,7 +258,12 @@ class Renewer(threading.Thread):
             try:
                 call("POST", "/r/%s/renew" % self.resource, {"owner": self.owner, "lease": self.lease_s})
             except ServerError as err:
-                if err.status == 409 and not self.lost:
+                p = err.payload or {}
+                if err.status == 409 and p.get("error") == "over_max_hold":
+                    if not self.over:
+                        self.over = True
+                        say("WARNING: %s; evicted in %s" % (p.get("message"), fmt_s(p.get("evict_in_s"))))
+                elif err.status == 409 and not self.lost:
                     self.lost = True
                     say("WARNING: lost %s (%s)" % (self.resource, (err.payload or {}).get("message")))
             except Unreachable as err:
@@ -321,6 +329,9 @@ def cmd_renew(args):
     try:
         _, out = call("POST", "/r/%s/renew" % res, body)
     except ServerError as err:
+        if (err.payload or {}).get("error") == "over_max_hold":
+            print("OVER_MAX_HOLD waiting=%s" % err.payload.get("waiting"))
+            server_error_exit(err)
         print("NOT_HOLDER holder=%s" % ((err.payload or {}).get("holder") or {}).get("owner", ""))
         server_error_exit(err)
     except Unreachable as err:

@@ -114,7 +114,7 @@ curl -s -XPOST $HWLOCK_URL/r/jetson/release -d '{"owner":"job-1"}'              
 | `GET /health` | Liveness check. It never needs a token. |
 | `GET /` | HTML status page that refreshes every 3 s. With a token set, open `/?token=…` (a browser cannot send a bearer header). |
 | `GET /status`, `GET /status/<resource>` | JSON: holder (owner, reason, host, pid, since, lease left) and queue. |
-| `GET /events?resource=&after=&limit=` | Audit log, with these event kinds: `create`, `enqueue`, `acquire`, `reacquire`, `renew`, `release`, `expire`, `drop`, `abandon`, `cancel`, `force_release`, `server_start`. |
+| `GET /events?resource=&after=&limit=` | Audit log, with these event kinds: `create`, `enqueue`, `acquire`, `reacquire`, `renew`, `release`, `expire`, `drop`, `abandon`, `cancel`, `force_release`, `renew_refused`, `evict_max_hold`, `server_start`. |
 | `POST /r/<res>/acquire` | Body `{owner, reason?, host?, pid?, lease?, ticket?, wait?}`. Returns 200 acquired, 202 waiting or 410 ticket gone. |
 | `POST /r/<res>/renew` | Body `{owner, lease?}`. Returns 200, or 409 not holder. |
 | `POST /r/<res>/release` | Body `{owner}`. Returns 200, or 409 not holder. |
@@ -129,6 +129,7 @@ Settings, all optional:
 - `HWLOCK_MAX_LEASE_S`: maximum lease, 86400.
 - `HWLOCK_HEARTBEAT_S`: heartbeat window for waiting tickets, 120. It must be at least `HWLOCK_POLL_S` + 5.
 - `HWLOCK_POLL_S`: how long the server holds a long-poll, 25.
+- `HWLOCK_MAX_HOLD_S`: starvation guard, 0 (off). When set, a holder that has held a resource longer than this while others wait cannot renew or re-acquire it (409 `over_max_hold`; the CLI prints `OVER_MAX_HOLD waiting=N` and exits 1), and `HWLOCK_HOLD_GRACE_S` (300) later it is evicted (`evict_max_hold` event). Nobody waiting means no limit.
 - `HWLOCK_SWEEP_S`: how often expired leases and dead tickets are checked, 1.
 - `HWLOCK_DB`, `HWLOCK_HOST`, `HWLOCK_PORT`: where the database lives and where the server listens.
 

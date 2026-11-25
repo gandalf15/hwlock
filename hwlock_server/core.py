@@ -84,6 +84,10 @@ class NotHolder(HwlockError):
     status, code = 409, "not_holder"
 
 
+class OverMaxHold(HwlockError):
+    status, code = 409, "over_max_hold"
+
+
 class TicketGone(HwlockError):
     status, code = 410, "ticket_gone"
 
@@ -120,6 +124,8 @@ class Store:
         default_lease_s: float = 1800,
         max_lease_s: float = 86400,
         heartbeat_s: float = 120,
+        max_hold_s: float = 0,
+        hold_grace_s: float = 300,
         clock: Callable[[], float] = time.time,
         log: Callable[[str], None] | None = None,
     ):
@@ -128,6 +134,10 @@ class Store:
         self.default_lease_s = default_lease_s
         self.max_lease_s = max_lease_s
         self.heartbeat_s = heartbeat_s
+        # Starvation guard (0 = off): while others wait, a holder may keep the lock at most max_hold_s
+        # from when it took it; after that renew/re-acquire is refused, and hold_grace_s later it is evicted.
+        self.max_hold_s = max_hold_s
+        self.hold_grace_s = hold_grace_s
         self.clock = clock
         self.log = log
         self.lock = threading.RLock()
@@ -156,14 +166,22 @@ class Store:
             self._dirty = False
             try:
                 yield self.clock()
+            except HwlockError:
+                # A refused request (not holder, over max hold, ...): what was done before the refusal
+                # (sweep evictions, the refusal's own event) is valid state, so keep it.
+                self._commit()
+                raise
             except BaseException:
                 self.db.execute("ROLLBACK")
                 raise
             else:
-                self.db.execute("COMMIT")
-                if self._dirty:
-                    self.changes += 1
-                    self.cond.notify_all()
+                self._commit()
+
+    def _commit(self):
+        self.db.execute("COMMIT")
+        if self._dirty:
+            self.changes += 1
+            self.cond.notify_all()
 
     def _event(self, now, resource, kind, owner=None, ticket=None, detail=None):
         self._dirty = True
@@ -210,6 +228,16 @@ class Store:
             self._event(now, r["name"], "expire", r["holder_owner"], r["holder_ticket"],
                         {"held_s": round(now - r["since"], 3), "overdue_s": round(now - r["expires"], 3)})
             changes += 1
+        if self.max_hold_s > 0:
+            for r in self.db.execute(
+                "SELECT * FROM resources WHERE holder_owner IS NOT NULL AND since <= ?"
+                " AND EXISTS (SELECT 1 FROM tickets WHERE tickets.resource = resources.name)",
+                (now - self.max_hold_s - self.hold_grace_s,),
+            ).fetchall():
+                self._clear(r["name"])
+                self._event(now, r["name"], "evict_max_hold", r["holder_owner"], r["holder_ticket"],
+                            {"held_s": round(now - r["since"], 3), "max_hold_s": self.max_hold_s})
+                changes += 1
         for t in self.db.execute(
             "SELECT * FROM tickets WHERE last_seen < ?", (now - self.heartbeat_s,)
         ).fetchall():
@@ -232,6 +260,19 @@ class Store:
             "expires": r["expires"], "lease_s": r["lease_s"],
             "held_s": round(now - r["since"], 3), "lease_left_s": round(r["expires"] - now, 3),
         }
+
+    def _check_max_hold(self, r, now):
+        """Refuse to extend a lock held longer than max_hold_s while others wait."""
+        if self.max_hold_s <= 0 or now - r["since"] <= self.max_hold_s:
+            return
+        waiting = self.db.execute("SELECT COUNT(*) FROM tickets WHERE resource=?", (r["name"],)).fetchone()[0]
+        if waiting:
+            self._event(now, r["name"], "renew_refused", r["holder_owner"], r["holder_ticket"],
+                        {"held_s": round(now - r["since"], 3), "waiting": waiting})
+            raise OverMaxHold(
+                f"{r['holder_owner']} has held {r['name']} for {now - r['since']:.0f} s (> {self.max_hold_s:g} s)"
+                f" while {waiting} wait: renew refused, release it", waiting=waiting,
+                evict_in_s=round(r["since"] + self.max_hold_s + self.hold_grace_s - now, 3))
 
     def _position(self, resource, ticket_id) -> int:
         return self.db.execute(
@@ -261,6 +302,7 @@ class Store:
             r = self._resource(now, resource)
             if r["holder_owner"] == owner:
                 # Idempotent re-acquire by the holder: keep holding, refresh the lease.
+                self._check_max_hold(r, now)
                 if ticket is not None and ticket != r["holder_ticket"]:
                     self.db.execute("DELETE FROM tickets WHERE id=? AND resource=? AND owner=?",
                                     (ticket, resource, owner))
@@ -363,6 +405,7 @@ class Store:
             if r is None or r["holder_owner"] != owner:
                 raise NotHolder(f"{owner} does not hold {resource}",
                                 holder=self._holder(r, now))
+            self._check_max_hold(r, now)
             self.db.execute("UPDATE resources SET expires=?, lease_s=? WHERE name=?",
                             (now + lease, lease, resource))
             self._event(now, resource, "renew", owner, r["holder_ticket"], {"lease_s": lease})

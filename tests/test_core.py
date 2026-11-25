@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from hwlock_server.core import BadRequest, NotHolder, Store, TicketGone
+from hwlock_server.core import BadRequest, NotHolder, OverMaxHold, Store, TicketGone
 
 
 class Clock:
@@ -245,3 +245,35 @@ def test_long_poll_drops_ticket_when_client_hangs_up_before_its_turn(store):
     th.join(3)
     assert out["res"]["state"] == "abandoned"
     assert store.status("gpu")["queue"] == [] and kinds(store)[-1] == "abandon"
+
+
+def test_starvation_guard_refuses_renew_then_evicts_while_others_wait(tmp_path, clock):
+    s = Store(str(tmp_path / "g.db"), default_lease_s=100, max_lease_s=1000, heartbeat_s=10_000,
+              max_hold_s=500, hold_grace_s=50, clock=clock)
+    s.acquire_step("gpu", "hog")
+    for _ in range(6):  # nobody waiting: no limit
+        clock.advance(90)
+        s.renew("gpu", "hog")
+    assert s.status("gpu")["holder"]["owner"] == "hog"  # held 540 s > 500 s, still fine
+    t = s.acquire_step("gpu", "next")["ticket"]
+    with pytest.raises(OverMaxHold) as e:
+        s.renew("gpu", "hog")
+    assert e.value.extra["waiting"] == 1
+    with pytest.raises(OverMaxHold):
+        s.acquire_step("gpu", "hog")  # re-acquire is a renewal too
+    assert kinds(s)[-1] == "renew_refused"  # the refusal is logged (not rolled back)
+    clock.advance(5)  # held 545 s < 500 + 50: not evicted yet
+    assert s.acquire_step("gpu", "next", ticket=t)["state"] == "waiting"
+    clock.advance(10)  # held 555 s > 550 s
+    assert s.acquire_step("gpu", "next", ticket=t)["state"] == "acquired"
+    assert "evict_max_hold" in kinds(s)
+    s.close()
+
+
+def test_starvation_guard_off_by_default(store, clock):
+    store.acquire_step("gpu", "hog")
+    store.acquire_step("gpu", "next")
+    for _ in range(100):
+        clock.advance(90)
+        store.renew("gpu", "hog")
+    assert store.status("gpu")["holder"]["owner"] == "hog"

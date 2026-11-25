@@ -255,3 +255,16 @@ def test_config_file_supplies_url_and_token(make_server, tmp_path):
     r = run_client(srv, "acquire", "jetson", "cfg", env=env)
     assert r.returncode == 0, r.stderr
     assert srv.api.status("jetson")["holder"]["owner"] == "cfg"
+
+
+def test_renew_over_max_hold_prints_like_jetson_lock(make_server):
+    server = make_server(HWLOCK_MAX_HOLD_S="1", HWLOCK_HOLD_GRACE_S="2")
+    run_client(server, "acquire", "jetson", "hog")
+    waiter = popen_client(server, "acquire", "jetson", "next", env=FAST)
+    wait_for(lambda: server.api.status("jetson")["queue"])
+    time.sleep(1.2)
+    r = run_client(server, "renew", "jetson", "hog")
+    assert r.returncode == 1 and r.stdout.startswith("OVER_MAX_HOLD waiting=1"), (r.stdout, r.stderr)
+    waiter.wait(10)  # evicted after max hold + grace
+    assert waiter.returncode == 0 and holder(server.api) == "next"
+    assert server.api.events("jetson", {"evict_max_hold"})[0]["owner"] == "hog"

@@ -7,7 +7,7 @@ Routes (JSON in/out; all except /health need `Authorization: Bearer $HWLOCK_TOKE
   GET  /events[?resource=R&after=ID&limit=N]   audit log
   POST /r/<resource>/acquire        {owner, reason?, host?, pid?, lease?, ticket?, wait?}
          200 acquired | 202 waiting (long-polls up to `wait` s, capped by the server) | 410 ticket gone
-  POST /r/<resource>/renew          {owner, lease?}           200 | 409 not holder
+  POST /r/<resource>/renew          {owner, lease?}           200 | 409 not holder / over_max_hold
   POST /r/<resource>/release        {owner}                   200 | 409 not holder
   POST /r/<resource>/cancel         {ticket, owner?}          200 (also releases if that ticket was granted)
   POST /r/<resource>/force-release  {by, reason?}             200 | 409 not held  (admin; logged)
@@ -43,6 +43,8 @@ class Config:
         self.max_lease_s = float(kw.get("max_lease_s") or env("HWLOCK_MAX_LEASE_S", "86400"))
         self.heartbeat_s = float(kw.get("heartbeat_s") or env("HWLOCK_HEARTBEAT_S", "120"))
         self.poll_s = float(kw.get("poll_s") or env("HWLOCK_POLL_S", "25"))
+        self.max_hold_s = float(kw.get("max_hold_s") or env("HWLOCK_MAX_HOLD_S", "0"))
+        self.hold_grace_s = float(kw.get("hold_grace_s") or env("HWLOCK_HOLD_GRACE_S", "300"))
         self.sweep_s = float(kw.get("sweep_s") or env("HWLOCK_SWEEP_S", "1"))
         if self.heartbeat_s < self.poll_s + 5:
             raise ValueError("HWLOCK_HEARTBEAT_S must be at least HWLOCK_POLL_S + 5 so a long-polling"
@@ -235,7 +237,8 @@ class App:
         self.cfg = cfg
         os.makedirs(os.path.dirname(os.path.abspath(cfg.db)), exist_ok=True)
         self.store = Store(cfg.db, default_lease_s=cfg.default_lease_s, max_lease_s=cfg.max_lease_s,
-                           heartbeat_s=cfg.heartbeat_s,
+                           heartbeat_s=cfg.heartbeat_s, max_hold_s=cfg.max_hold_s,
+                           hold_grace_s=cfg.hold_grace_s,
                            log=lambda m: print(f"hwlock: {m}", flush=True))
         self.httpd = Server((cfg.host, cfg.port), Handler)
         self.httpd.app = self  # type: ignore[attr-defined]
