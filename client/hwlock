@@ -13,7 +13,9 @@ Single file, Python >= 3.8 standard library only: copy it anywhere.
   hwlock hold    <resource> <owner> [reason] --until-file F [--lease S] [--max-wait S] [--max-hold S]
                  [--new-ticket]
   hwlock events  [resource] [--limit N] [--json]
+  hwlock watch   <resource> [--until STATE] [--timeout S] [--json]
   hwlock force-release <resource> <by> [reason]          (admin; logged)
+acquire/run/hold also take: --fail-if-down --exit-on-degraded; run also: --on-down kill|warn
 
 acquire waits in FIFO order (long-poll: the server holds each request ~25 s, nobody polls fast),
 prints the queue position to stderr while waiting, and exits once you hold the lock. The lease
@@ -39,6 +41,15 @@ it. Nobody waiting = no limit. --max-hold S asks for a shorter limit for this ho
 sends SIGTERM (SIGKILL 10 s later) so the command is gone before the eviction, and exits 5.
 `hold` exits 5 once the lock is gone.
 
+Hardware health (resources with probes on the server): the server checks the device every few
+seconds and tells waiting and holding clients at once when it goes DOWN, comes back, is DEGRADED (e.g.
+low memory, hot) or REBOOTED (boot id changed: the holder's lease is voided, waiters keep their place).
+While a device is down nobody is granted it; `acquire` keeps waiting and prints the state
+(--fail-if-down: exit 6 instead). `run` stops the command (SIGTERM, SIGKILL 10 s later) when the device
+goes down (exit 6) or reboots (exit 7); --on-down=warn only warns. `hold` exits 6/7. Degraded is a
+warning; --exit-on-degraded treats it like down but exits 8. `watch` blocks until the next health
+change (or until --until STATE) and exits with its code: run it as a background command to be notified.
+
 Env: HWLOCK_URL (default http://127.0.0.1:8770), HWLOCK_TOKEN (bearer token, optional). Without them,
 `url=` and `token=` lines in ~/.config/hwlock/config (or $HWLOCK_CONFIG) are used.
 
@@ -47,7 +58,11 @@ Exit codes: 0 ok | 1 not the holder / not held (renew, release, force-release) |
 5 OVER_MAX_HOLD: renew/re-acquire refused, held past the max hold while others wait; `hold` lost the
 lock that way; `run --kill-on-preempt` stopped the command | 130 Ctrl-C while waiting (ticket
 cancelled) | 143 SIGTERM while waiting (ticket kept for re-attach) |
-run: the command's exit code (128+N if killed by signal N).
+6 the device is DOWN (acquire --fail-if-down; run/hold stopped; watch saw it go down) |
+7 the device REBOOTED (your lease was voided: re-check your setup on it; watch saw a reboot) |
+8 the device is DEGRADED (--exit-on-degraded; watch saw it degrade) |
+run: the command's exit code (128+N if killed by signal N), or 6/7/8 when it was stopped for health.
+watch: 0 back up, 6 down, 7 rebooted, 8 degraded, 3 --timeout passed.
 """
 
 import json
@@ -85,6 +100,7 @@ TOKEN = os.environ.get("HWLOCK_TOKEN") or _CONF.get("token") or ""
 LONG_POLL_S = float(os.environ.get("HWLOCK_LONG_POLL_S", "25"))
 EXIT_OK, EXIT_NOT_HOLDER, EXIT_USAGE, EXIT_TIMEOUT, EXIT_SERVER, EXIT_PREEMPTED, EXIT_INT = 0, 1, 2, 3, 4, 5, 130
 EXIT_TERM = 143
+EXIT_DOWN, EXIT_REBOOTED, EXIT_DEGRADED = 6, 7, 8
 KILL_AFTER_S = 10.0  # run --kill-on-preempt: SIGTERM, then SIGKILL this much later
 
 
@@ -154,8 +170,53 @@ def holder_text(h):
                                     fmt_s(h.get("lease_left_s")))
 
 
+def metrics_text(m):
+    """The exporter's main numbers, short (for status and watch)."""
+    if not isinstance(m, dict):
+        return ""
+    bits = []
+    if isinstance(m.get("mem_available_mb"), (int, float)):
+        bits.append("mem free %.0f%s MB" % (m["mem_available_mb"], "/%.0f" % m["mem_total_mb"]
+                                            if isinstance(m.get("mem_total_mb"), (int, float)) else ""))
+    if isinstance(m.get("load1"), (int, float)):
+        bits.append("load %.2f" % m["load1"])
+    if isinstance(m.get("temp_max_c"), (int, float)):
+        bits.append("max %.0f C" % m["temp_max_c"])
+    if isinstance(m.get("gpu_load_pct"), (int, float)):
+        bits.append("GPU %.0f%%" % m["gpu_load_pct"])
+    if isinstance(m.get("uptime_s"), (int, float)):
+        bits.append("up %s" % fmt_s(m["uptime_s"]))
+    if m.get("nvpmodel"):
+        bits.append(str(m["nvpmodel"]))
+    return ", ".join(bits)
+
+
+def health_text(res, hv):
+    """'jetson is DOWN (for 12s): ssh_banner ...: TCP accepted but no SSH banner'"""
+    s = "%s is %s" % (res, str(hv.get("state", "unknown")).upper())
+    if hv.get("for_s") is not None:
+        s += " (for %s)" % fmt_s(hv["for_s"])
+    if hv.get("reason"):
+        s += ": %s" % hv["reason"]
+    return s
+
+
+HEALTH_EXIT = {"down": EXIT_DOWN, "degraded": EXIT_DEGRADED, "rebooted": EXIT_REBOOTED, "up": EXIT_OK,
+               "unknown": EXIT_OK}
+
+
+def voided_exit(p):
+    """409 not_holder because the device rebooted (the server voided the lease): exit 7."""
+    v = p.get("voided") or {}
+    print("VOIDED_REBOOT booted_at=%s" % time.strftime("%H:%M:%S", time.localtime(v.get("booted_at") or v.get("at") or 0)))
+    die("%s. Whatever you set up on the device is gone: acquire again and re-check your setup before"
+        " going on" % p.get("message"), EXIT_REBOOTED)
+
+
 def server_error_exit(err):
     p = err.payload or {}
+    if err.status == 409 and p.get("voided"):
+        voided_exit(p)
     if err.status == 401:
         die("unauthorized: set HWLOCK_TOKEN to the server's token", EXIT_SERVER)
     if err.status == 409 and p.get("error") == "over_max_hold":
@@ -171,8 +232,10 @@ class Acquirer(object):
     """Takes a ticket and long-polls until granted. Survives server restarts (re-attaches by ticket)."""
 
     def __init__(self, resource, owner, reason=None, lease=None, max_wait=None, pid=None, max_hold=None,
-                 new_ticket=False):
+                 new_ticket=False, fail_if_down=False, exit_on_degraded=False):
         self.resource, self.owner, self.reason = resource, owner, reason
+        self.fail_if_down, self.exit_on_degraded = fail_if_down, exit_on_degraded
+        self.health = None  # the device's health from the last answer (None: no probes on the server)
         self.lease, self.max_wait, self.max_hold = lease, max_wait, max_hold
         self.new_ticket = new_ticket  # only on the first request: drop our old ticket, join at the back
         self.pid = pid if pid is not None else os.getppid()
@@ -231,18 +294,50 @@ class Acquirer(object):
                 say("re-attached to ticket %s (kept its place in the queue)" % out.get("ticket"))
             self.new_ticket = False
             self.ticket = out.get("ticket")
+            self._on_health(out)
             if out.get("state") == "acquired":
                 self.granted = True
                 return out
             h = out.get("holder")
-            msg = "waiting for %s: position %s of %s, ticket %s, holder %s%s" % (
+            msg = "waiting for %s: position %s of %s, ticket %s, holder %s%s%s" % (
                 self.resource, out.get("position"), out.get("queue_length"), self.ticket,
                 ("%s%s" % (h["owner"], (": " + h["reason"]) if h.get("reason") else "")) if h else "none",
                 " (%s dormant ticket(s) ahead, skipped unless re-attached)" % out["dormant_ahead"]
-                if out.get("dormant_ahead") else "")
+                if out.get("dormant_ahead") else "",
+                "; nobody gets it while it is DOWN" if (out.get("health") or {}).get("state") == "down" else "")
             if msg != last_msg:
                 say(msg)
                 last_msg = msg
+
+    def _on_health(self, out):
+        """Tell the user about the device's health as soon as an answer shows a change (the server ends a
+        long-poll early on every health event), and give up if asked to (--fail-if-down, --exit-on-degraded)."""
+        hv = out.get("health")
+        if not hv:
+            return
+        prev, self.health = self.health, hv
+        waiting = out.get("state") == "waiting"
+        if prev is not None and hv.get("last_reboot") and hv.get("last_reboot") != prev.get("last_reboot"):
+            say("WARNING: %s REBOOTED (boot id changed)%s" % (
+                self.resource, "; your place in the queue is kept. Re-check what you need on it once you hold it"
+                if waiting else ""))
+        if prev is None or prev.get("state") != hv["state"]:
+            st = hv["state"]
+            if st == "down":
+                say("WARNING: %s; nobody is granted it until it is back. %s" % (
+                    health_text(self.resource, hv), "Still waiting (--fail-if-down gives up)." if waiting
+                    and not self.fail_if_down else ""))
+            elif st == "degraded":
+                say("WARNING: %s" % health_text(self.resource, hv))
+            elif prev is not None:
+                say("%s is %s again" % (self.resource, st.upper()))
+        if waiting and hv["state"] == "down" and self.fail_if_down:
+            self.cancel()
+            die("%s; gave up (--fail-if-down), ticket withdrawn" % health_text(self.resource, hv), EXIT_DOWN)
+        if waiting and hv["state"] == "degraded" and self.exit_on_degraded:
+            self.cancel()
+            die("%s; gave up (--exit-on-degraded), ticket withdrawn" % health_text(self.resource, hv),
+                EXIT_DEGRADED)
 
     def cancel(self):
         """Withdraw our ticket (also releases if it was granted in the meantime)."""
@@ -267,15 +362,22 @@ class Acquirer(object):
             return None
 
 
-def acquire_or_exit(resource, owner, reason, lease, max_wait, pid=None, max_hold=None, new_ticket=False):
-    acq = Acquirer(resource, owner, reason, lease, max_wait, pid, max_hold, new_ticket)
+def acquire_or_exit(resource, owner, reason, lease, max_wait, pid=None, max_hold=None, new_ticket=False,
+                    fail_if_down=False, exit_on_degraded=False):
+    acq = Acquirer(resource, owner, reason, lease, max_wait, pid, max_hold, new_ticket, fail_if_down,
+                   exit_on_degraded)
 
     def terminated(_signum, _frame):
         raise Terminated()
 
     old = signal.signal(signal.SIGTERM, terminated)
     try:
-        return acq.run()
+        out = acq.run()
+        hv = out.get("health") or {}
+        if hv.get("state") == "degraded" and exit_on_degraded:
+            release(resource, owner, quiet=True)
+            die("%s; released again (--exit-on-degraded)" % health_text(resource, hv), EXIT_DEGRADED)
+        return out
     except KeyboardInterrupt:
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         acq.cancel()
@@ -329,6 +431,7 @@ class Renewer(threading.Thread):
         self.lease_s = float(lease_s)
         self.stop_ev = threading.Event()
         self.lost = False
+        self.voided = None  # the server's "voided" detail when the lease ended because the device rebooted
         self.over = None  # the server's over_max_hold payload once a renew was refused
         self.guard = guard  # the holder's "guard" from the last answer (acquire, renew or status)
         self.next_renew = time.monotonic() + max(0.2, self.lease_s / 3.0)
@@ -392,12 +495,63 @@ class Renewer(threading.Thread):
                     if self.on_refused:
                         self.on_refused(p)
                 elif err.status == 409:
+                    self.voided = p.get("voided")
                     self._lose(p.get("message"))
             except Unreachable as err:
                 say("renew failed (%s); will retry" % err)
 
     def stop(self):
         self.stop_ev.set()
+
+
+class HealthWatcher(threading.Thread):
+    """For run/hold: long-polls GET /r/<res>/health?after=SEQ, so a holder learns at once that its device
+    went down, rebooted (lease voided) or degraded, instead of at the next renew. on_event(event, health)
+    is called for each health event in order. Quietly ends if the server has no probes for the resource."""
+
+    def __init__(self, resource, seq, on_event):
+        threading.Thread.__init__(self, name="hwlock-health", daemon=True)
+        self.resource, self.seq, self.on_event = resource, int(seq or 0), on_event
+        self.stop_ev = threading.Event()
+
+    def run(self):
+        backoff = 1.0
+        while not self.stop_ev.is_set():
+            try:
+                _, out = call("GET", "/r/%s/health?after=%d&wait=%g" % (self.resource, self.seq, LONG_POLL_S),
+                              timeout=LONG_POLL_S + 15)
+                backoff = 1.0
+            except ServerError as err:
+                if err.status == 404:
+                    return
+                self.stop_ev.wait(backoff)
+                backoff = min(backoff * 1.5, 5.0)
+                continue
+            except Unreachable:
+                self.stop_ev.wait(backoff)
+                backoff = min(backoff * 1.5, 5.0)
+                continue
+            hv = out.get("health") or {}
+            for e in out.get("events") or []:
+                if self.stop_ev.is_set():
+                    return
+                self.on_event(e, hv)
+            self.seq = max(self.seq, int(hv.get("seq") or 0))
+
+    def stop(self):
+        self.stop_ev.set()
+
+
+def health_event_text(res, e, hv):
+    d = e.get("detail") or {}
+    k = e["kind"]
+    if k == "rebooted":
+        return "%s REBOOTED (boot id changed; booted %s)" % (
+            res, time.strftime("%H:%M:%S", time.localtime(d["booted_at"])) if d.get("booted_at") else "?")
+    if k == "lease_voided_reboot":
+        return "%s rebooted: the lease of %s was voided" % (res, e.get("owner"))
+    st = k[len("health_"):] if k.startswith("health_") else k
+    return "%s is %s%s" % (res, st.upper(), (": " + d["reason"]) if d.get("reason") else "")
 
 
 # ---------------------------------------------------------------------------- argument parsing
@@ -453,10 +607,12 @@ def guard_text(g):
 
 
 def cmd_acquire(args):
-    (res, owner, *rest), o, _ = parse(args, 2, 3, {"lease": float, "max-wait": float, "max-hold": float,
-                                                   "new-ticket": bool})
+    (res, owner, *rest), o, _ = parse(args, 2, 3, dict({"lease": float, "max-wait": float, "max-hold": float,
+                                                        "new-ticket": bool}, **HEALTH_FLAGS))
     out = acquire_or_exit(res, owner, rest[0] if rest else None, o.get("lease"), o.get("max-wait"),
-                          max_hold=o.get("max-hold"), new_ticket=o.get("new-ticket", False))
+                          max_hold=o.get("max-hold"), new_ticket=o.get("new-ticket", False),
+                          fail_if_down=o.get("fail-if-down", False),
+                          exit_on_degraded=o.get("exit-on-degraded", False))
     print("hwlock: " + acquired_msg(out, owner))
     return EXIT_OK
 
@@ -473,11 +629,15 @@ def cmd_renew(args):
             print("OVER_MAX_HOLD waiting=%s evict_in=%s" % (err.payload.get("waiting"),
                                                            int(err.payload.get("evict_in_s") or 0)))
             server_error_exit(err)
-        print("NOT_HOLDER holder=%s" % ((err.payload or {}).get("holder") or {}).get("owner", ""))
+        if not (err.payload or {}).get("voided"):
+            print("NOT_HOLDER holder=%s" % ((err.payload or {}).get("holder") or {}).get("owner", ""))
         server_error_exit(err)
     except Unreachable as err:
         die(str(err), EXIT_SERVER)
     print("RENEWED lease left %s" % fmt_s(out["holder"]["lease_left_s"]))
+    hv = out.get("health") or {}
+    if hv.get("state") in ("down", "degraded"):
+        say("WARNING: %s" % health_text(res, hv))
     return EXIT_OK
 
 
@@ -486,7 +646,8 @@ def cmd_release(args):
     try:
         call("POST", "/r/%s/release" % res, {"owner": owner})
     except ServerError as err:
-        print("NOT_HOLDER holder=%s" % ((err.payload or {}).get("holder") or {}).get("owner", ""))
+        if not (err.payload or {}).get("voided"):
+            print("NOT_HOLDER holder=%s" % ((err.payload or {}).get("holder") or {}).get("owner", ""))
         server_error_exit(err)
     except Unreachable as err:
         die(str(err), EXIT_SERVER)
@@ -506,6 +667,16 @@ def cmd_status(args):
         print(json.dumps(out, indent=2))
         return EXIT_OK
     for r in out.get("resources", [out]):
+        hv = r.get("health")
+        if hv:
+            m = metrics_text(hv.get("metrics"))
+            print("%s: health %s for %s%s%s%s" % (
+                r["resource"], hv["state"].upper(), fmt_s(hv.get("for_s")),
+                (": " + hv["reason"]) if hv.get("reason") and hv["state"] != "up" else "",
+                ("  [" + m + "]") if m else "",
+                ("  checked %s ago" % fmt_s(hv["checked_s_ago"])) if hv.get("checked_s_ago") is not None else ""))
+            if hv.get("last_reboot"):
+                print("  last reboot %s" % time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(hv["last_reboot"])))
         h = r["holder"]
         if h:
             print("%s: held by %s  since %s  held %s  lease left %s  host %s pid %s  reason: %s%s" % (
@@ -559,36 +730,77 @@ def _lease_of(out, requested):
     return requested or (out.get("holder") or {}).get("lease_s") or 1800
 
 
+HEALTH_FLAGS = {"fail-if-down": bool, "exit-on-degraded": bool}
+
+
+def _health_watch(res, owner, out, on_health, exit_on_degraded):
+    """Start a HealthWatcher for a holder (run/hold) if the resource has probes. on_health(code, msg) is
+    called when the holder must stop: down (6), its lease voided by a reboot (7), degraded with
+    --exit-on-degraded (8). Other changes are printed as warnings."""
+    hv = out.get("health")
+    if not hv:
+        return None
+
+    def on_event(e, cur):
+        k = e["kind"]
+        text = health_event_text(res, e, cur)
+        if k == "health_down":
+            on_health(EXIT_DOWN, text)
+        elif k == "lease_voided_reboot" and e.get("owner") == owner:
+            on_health(EXIT_REBOOTED, text + " (that is you: whatever ran on the device is gone)")
+        elif k == "health_degraded" and exit_on_degraded:
+            on_health(EXIT_DEGRADED, text)
+        elif k in ("health_degraded", "rebooted"):
+            say("WARNING: " + text)
+        elif k != "lease_voided_reboot":
+            say(text)
+
+    w = HealthWatcher(res, hv.get("seq"), on_event)
+    w.start()
+    return w
+
+
 def cmd_run(args):
-    pos, o, cmd = parse(args, 2, 3, {"lease": float, "max-wait": float, "max-hold": float,
-                                     "kill-on-preempt": bool, "new-ticket": bool}, allow_dashdash=True)
+    pos, o, cmd = parse(args, 2, 3, dict({"lease": float, "max-wait": float, "max-hold": float,
+                                          "kill-on-preempt": bool, "new-ticket": bool, "on-down": str},
+                                         **HEALTH_FLAGS), allow_dashdash=True)
     if not cmd:
         die("usage: hwlock run <resource> <owner> [reason] -- <cmd...>")
+    on_down = o.get("on-down", "kill")
+    if on_down not in ("kill", "warn"):
+        die("--on-down must be kill or warn")
     res, owner = pos[0], pos[1]
     kill = o.get("kill-on-preempt", False)
     import subprocess
 
     out = acquire_or_exit(res, owner, pos[2] if len(pos) > 2 else None, o.get("lease"), o.get("max-wait"),
-                          pid=os.getpid(), max_hold=o.get("max-hold"), new_ticket=o.get("new-ticket", False))
+                          pid=os.getpid(), max_hold=o.get("max-hold"), new_ticket=o.get("new-ticket", False),
+                          fail_if_down=o.get("fail-if-down", False),
+                          exit_on_degraded=o.get("exit-on-degraded", False))
     say(acquired_msg(out, owner))
     child = None
     old = {}
     preempted = []
+    health_exit = []  # the exit code (6/7/8) once the device's health stopped the command
+    terminating = []
+
+    def terminate(after, why=""):
+        """SIGTERM the command now, SIGKILL `after` seconds later (once)."""
+        if terminating or child is None or child.poll() is not None:
+            return
+        terminating.append(after)
+        say("%sstopping the command (SIGTERM now, SIGKILL in %s if it is still running)" % (why, fmt_s(after)))
+        send(signal.SIGTERM)
+        t = threading.Timer(after, send, (signal.SIGKILL,))
+        t.daemon = True
+        t.start()
 
     def stop_child(why, deadline_s):
         """--kill-on-preempt: SIGTERM now, SIGKILL before the lock goes to the next holder."""
         if preempted:
             return
         preempted.append(why)
-        if child is None or child.poll() is not None:
-            return
-        after = max(0.0, min(KILL_AFTER_S, deadline_s - 1.0))
-        say("--kill-on-preempt: stopping the command (SIGTERM now, SIGKILL in %s if it is still running)"
-            % fmt_s(after))
-        send(signal.SIGTERM)
-        t = threading.Timer(after, send, (signal.SIGKILL,))
-        t.daemon = True
-        t.start()
+        terminate(max(0.0, min(KILL_AFTER_S, deadline_s - 1.0)), "--kill-on-preempt: ")
 
     def on_refused(p):
         if kill:
@@ -598,13 +810,27 @@ def cmd_run(args):
             say("the command keeps running (no --kill-on-preempt); it must not use %s after that" % res)
 
     def on_lost(msg):
+        if health_exit:
+            return  # already handled as a health stop (a voided lease also shows up as a lost renew)
         if kill:
             stop_child("lost", 0)
         elif "lost" not in preempted:
             preempted.append("lost")
 
+    def on_health(code, msg):
+        if health_exit:
+            return
+        if on_down == "warn" and code != EXIT_DEGRADED:
+            say("WARNING: %s; the command keeps running (--on-down=warn): check its results" % msg)
+            preempted.append("health")
+            return
+        health_exit.append(code)
+        say("WARNING: %s; exit %d" % (msg, code))
+        terminate(KILL_AFTER_S)
+
     renewer = Renewer(res, owner, _lease_of(out, o.get("lease")), (out.get("holder") or {}).get("guard"),
                       on_refused, on_lost)
+    watcher = None
 
     def send(signum):
         if child is not None and child.poll() is None:
@@ -632,40 +858,62 @@ def cmd_run(args):
             say("cannot start %r: %s" % (cmd[0], err))
             return 127
         renewer.start()  # only now: a refusal must find the child to stop
+        watcher = _health_watch(res, owner, out, on_health, o.get("exit-on-degraded", False))
         while True:
             try:
                 rc = child.wait()
                 break
             except KeyboardInterrupt:  # pragma: no cover - handler replaced, kept for safety
                 send(signal.SIGINT)
+        if health_exit:
+            say("command stopped: %s; exit %d" % ({EXIT_DOWN: "the device went down",
+                                                   EXIT_REBOOTED: "the device rebooted",
+                                                   EXIT_DEGRADED: "the device is degraded"}[health_exit[0]],
+                                                  health_exit[0]))
+            return health_exit[0]
         if kill and preempted:
             say("command stopped: %s was taken away (max hold exceeded while others wait); exit %d"
                 % (res, EXIT_PREEMPTED))
             return EXIT_PREEMPTED
         if preempted:
-            say("WARNING: the command ran past the max hold of %s while others waited%s; check its results"
-                % (res, " and after the lock was gone" if "lost" in preempted or renewer.lost else ""))
+            say("WARNING: the command ran past %s%s; check its results" % (
+                "a health problem of %s" % res if "health" in preempted else
+                "the max hold of %s while others waited" % res,
+                " and after the lock was gone" if "lost" in preempted or renewer.lost else ""))
         return rc if rc >= 0 else 128 - rc
     finally:
         renewer.stop()
+        if watcher:
+            watcher.stop()
         for s, h in old.items():
             signal.signal(s, h)
-        release(res, owner)
+        release(res, owner, quiet=bool(renewer.voided or (health_exit and health_exit[0] == EXIT_REBOOTED)))
 
 
 def cmd_hold(args):
-    pos, o, _ = parse(args, 2, 3, {"lease": float, "max-wait": float, "max-hold": float, "until-file": str,
-                                   "poll": float, "new-ticket": bool})
+    pos, o, _ = parse(args, 2, 3, dict({"lease": float, "max-wait": float, "max-hold": float, "until-file": str,
+                                        "poll": float, "new-ticket": bool}, **HEALTH_FLAGS))
     if "until-file" not in o:
         die("usage: hwlock hold <resource> <owner> [reason] --until-file F")
     res, owner, until = pos[0], pos[1], o["until-file"]
     out = acquire_or_exit(res, owner, pos[2] if len(pos) > 2 else None, o.get("lease"), o.get("max-wait"),
-                          pid=os.getpid(), max_hold=o.get("max-hold"), new_ticket=o.get("new-ticket", False))
+                          pid=os.getpid(), max_hold=o.get("max-hold"), new_ticket=o.get("new-ticket", False),
+                          fail_if_down=o.get("fail-if-down", False),
+                          exit_on_degraded=o.get("exit-on-degraded", False))
     say(acquired_msg(out, owner) + "; holding until %s exists" % until)
     stop = threading.Event()
+    health_exit = []
+
+    def on_health(code, msg):
+        if not health_exit:
+            health_exit.append(code)
+            say("WARNING: %s; ending the hold (exit %d)" % (msg, code))
+            stop.set()
+
     renewer = Renewer(res, owner, _lease_of(out, o.get("lease")), (out.get("holder") or {}).get("guard"),
                       on_lost=lambda _msg: stop.set())
     renewer.start()
+    watcher = _health_watch(res, owner, out, on_health, o.get("exit-on-degraded", False))
     for s in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(s, lambda *_: stop.set())
     try:
@@ -675,8 +923,18 @@ def cmd_hold(args):
         pass
     finally:
         renewer.stop()
-        if not renewer.lost:
+        if watcher:
+            watcher.stop()
+        voided = renewer.voided or (health_exit and health_exit[0] == EXIT_REBOOTED)
+        if not renewer.lost and not voided:
             release(res, owner)
+    if health_exit or renewer.voided:
+        code = health_exit[0] if health_exit else EXIT_REBOOTED
+        say("hold of %s ended: %s; exit %d" % (res, {EXIT_DOWN: "the device is down (lock released)",
+                                                    EXIT_REBOOTED: "the device rebooted (lease voided)",
+                                                    EXIT_DEGRADED: "the device is degraded (lock released)"}[code],
+                                              code))
+        return code
     if renewer.lost:
         say("hold of %s ended: the lock is gone (%s); exit %d" % (
             res, "max hold exceeded while others waited" if renewer.over else "lease lost",
@@ -686,8 +944,74 @@ def cmd_hold(args):
     return EXIT_OK
 
 
+def cmd_watch(args):
+    """Block until the next health change of <resource> (or until it is in --until STATE), print it and
+    exit with its code: 0 up, 6 down, 7 rebooted, 8 degraded; 3 after --timeout. Meant to be started as a
+    background command by an agent: its exit is the notification."""
+    pos, o, _ = parse(args, 1, 1, {"until": str, "timeout": float, "json": bool})
+    res = pos[0]
+    until = o.get("until")
+    if until is not None and until not in ("up", "down", "degraded", "rebooted"):
+        die("--until must be up, down, degraded or rebooted")
+    deadline = time.monotonic() + o["timeout"] if "timeout" in o else None
+    seq, backoff, said = None, 1.0, None
+    while True:
+        wait = LONG_POLL_S if seq is not None else 0
+        if deadline is not None:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                say("no health change of %s within %ss" % (res, o["timeout"]))
+                return EXIT_TIMEOUT
+            wait = min(wait, left)
+        q = "/r/%s/health" % res + ("?after=%d&wait=%g" % (seq, wait) if seq is not None else "")
+        try:
+            _, out = call("GET", q, timeout=wait + 15)
+            backoff = 1.0
+        except ServerError as err:
+            if err.status == 404:
+                die("no health probes are configured for %s on the server (%s)" % (res, URL), EXIT_SERVER)
+            server_error_exit(err)
+        except Unreachable as err:
+            msg = "server unreachable (%s); retrying" % err
+            if msg != said:
+                say(msg)
+                said = msg
+            time.sleep(backoff)
+            backoff = min(backoff * 1.5, 5.0)
+            continue
+        hv = out.get("health") or {}
+        if seq is None:
+            m = metrics_text(hv.get("metrics"))
+            say("watching %s: %s%s" % (res, health_text(res, hv), ("  [" + m + "]") if m else ""))
+            seq = int(hv.get("seq") or 0)
+            if until is not None and until == hv.get("state"):
+                print(json.dumps(out) if o.get("json") else health_text(res, hv))
+                return HEALTH_EXIT[until]
+            continue
+        events = out.get("events") or []
+        seq = max(seq, int(hv.get("seq") or 0))
+        for e in events:
+            say(health_event_text(res, e, hv))
+        if not events:
+            continue
+        kinds = [("rebooted" if e["kind"] in ("rebooted", "lease_voided_reboot") else e["kind"][len("health_"):])
+                 for e in events]
+        if until is not None:
+            if until not in kinds and not (until != "rebooted" and hv.get("state") == until):
+                continue
+            hit = until
+        else:
+            hit = "rebooted" if "rebooted" in kinds else kinds[-1]
+        if o.get("json"):
+            print(json.dumps(out))
+        else:
+            print("%s %s" % (hit.upper(), health_text(res, hv)))
+        return HEALTH_EXIT.get(hit, EXIT_OK)
+
+
 COMMANDS = {"acquire": cmd_acquire, "renew": cmd_renew, "release": cmd_release, "status": cmd_status,
-            "run": cmd_run, "hold": cmd_hold, "events": cmd_events, "force-release": cmd_force_release}
+            "run": cmd_run, "hold": cmd_hold, "events": cmd_events, "watch": cmd_watch,
+            "force-release": cmd_force_release}
 
 
 def main(argv):
