@@ -55,5 +55,5 @@ renew|release)
                        echo "NOT_HOLDER holder=$(field owner "${r#* }")"; exit 1 ;;
                   *) echo "hwlock: server said ${r}" >&2; exit 4 ;; esac ;;
 status) curl -sS -m 15 "${auth[@]}" "$URL/status${1:+/$1}"; echo ;;
-*) sed -n '2,16p' "$0"; exit 2 ;;
+*) sed -n '2,15p' "$0"; exit 2 ;;
 esac
